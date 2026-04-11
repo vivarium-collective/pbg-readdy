@@ -1214,23 +1214,29 @@ function initViewer(sid) {{
       mesh.instanceMatrix.needsUpdate = true;
     }}
 
-    // Update bonds
+    // Update bonds — skip bonds that cross periodic boundaries
     const bonds = snap.bonds || [];
-    const nBonds = Math.min(bonds.length, maxBonds);
-    for (let i = 0; i < nBonds; i++) {{
+    const halfBox = [bs[0]*0.5, bs[1]*0.5, bs[2]*0.5];
+    let bondCount = 0;
+    for (let i = 0; i < bonds.length && bondCount < maxBonds; i++) {{
       const [a, b] = bonds[i];
       if (a < positions.length && b < positions.length) {{
-        bondPositions[i*6]   = positions[a][0];
-        bondPositions[i*6+1] = positions[a][1];
-        bondPositions[i*6+2] = positions[a][2];
-        bondPositions[i*6+3] = positions[b][0];
-        bondPositions[i*6+4] = positions[b][1];
-        bondPositions[i*6+5] = positions[b][2];
+        const dx = Math.abs(positions[a][0] - positions[b][0]);
+        const dy = Math.abs(positions[a][1] - positions[b][1]);
+        const dz = Math.abs(positions[a][2] - positions[b][2]);
+        if (dx > halfBox[0] || dy > halfBox[1] || dz > halfBox[2]) continue;
+        bondPositions[bondCount*6]   = positions[a][0];
+        bondPositions[bondCount*6+1] = positions[a][1];
+        bondPositions[bondCount*6+2] = positions[a][2];
+        bondPositions[bondCount*6+3] = positions[b][0];
+        bondPositions[bondCount*6+4] = positions[b][1];
+        bondPositions[bondCount*6+5] = positions[b][2];
+        bondCount++;
       }}
     }}
-    for (let i = nBonds * 6; i < maxBonds * 6; i++) bondPositions[i] = 0;
+    for (let i = bondCount * 6; i < maxBonds * 6; i++) bondPositions[i] = 0;
     bondGeo.attributes.position.needsUpdate = true;
-    bondGeo.setDrawRange(0, nBonds * 2);
+    bondGeo.setDrawRange(0, bondCount * 2);
   }}
 
   updateParticles(0);
