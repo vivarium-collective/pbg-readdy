@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "pbg-readdy"
+version = "0.1.0"
+description = "Process-bigraph wrapper for the ReaDDy particle-based reaction-diffusion simulator"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "process-bigraph>=1.0",
+    "bigraph-schema>=1.0",
+    "readdy>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "bigraph-viz",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+include = ["pbg_readdy*"]
