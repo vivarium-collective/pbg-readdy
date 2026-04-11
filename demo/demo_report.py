@@ -1,9 +1,10 @@
 """Demo: ReaDDy multi-configuration reaction-diffusion report with 3D viewers.
 
-Runs three distinct particle-based reaction-diffusion simulations
-(annihilation, Lotka-Volterra, crowded diffusion), generates interactive
-3D particle viewers with Three.js, Plotly charts, bigraph-viz diagrams,
-and navigatable PBG document trees — all in a single self-contained HTML.
+Runs four distinct particle-based reaction-diffusion simulations
+(actin treadmilling, Lotka-Volterra, living polymers, crowded diffusion),
+generates interactive 3D particle viewers with Three.js, Plotly charts,
+bigraph-viz diagrams, and navigatable PBG document trees in a single
+self-contained HTML.
 """
 
 import json
@@ -17,7 +18,7 @@ from pbg_readdy.processes import ReaDDyProcess
 from pbg_readdy.composites import make_readdy_document
 
 
-# ── Simulation Configs ──────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────
 
 def _random_positions(n, box_half=4.0, seed=None):
     if seed is not None:
@@ -25,56 +26,520 @@ def _random_positions(n, box_half=4.0, seed=None):
     return (np.random.random((n, 3)) * 2 * box_half - box_half).tolist()
 
 
-CONFIGS = [
-    {
-        'id': 'annihilation',
-        'title': 'Annihilation Kinetics',
-        'subtitle': 'A + A → B fusion with excluded-volume interactions',
-        'description': (
-            'Fifty A particles diffuse in a periodic box and undergo '
-            'bimolecular fusion (A + A → B) with strong excluded-volume '
-            'repulsion. As A particles are consumed, the slower-diffusing '
-            'B products accumulate. This demonstrates second-order reaction '
-            'kinetics in a crowded environment where spatial correlations '
-            'affect the effective reaction rate.'
-        ),
-        'config': {
-            'box_size': (12., 12., 12.),
-            'species': {'A': 1.0, 'B': 0.3},
-            'reactions': [
-                {'descriptor': 'fusion: A +(2) A -> B', 'rate': 5.0},
-            ],
-            'potentials': [
-                {'type': 'harmonic_repulsion', 'species1': 'A',
-                 'species2': 'A', 'force_constant': 10.,
-                 'interaction_distance': 1.5},
-                {'type': 'harmonic_repulsion', 'species1': 'A',
-                 'species2': 'B', 'force_constant': 10.,
-                 'interaction_distance': 1.5},
-                {'type': 'harmonic_repulsion', 'species1': 'B',
-                 'species2': 'B', 'force_constant': 10.,
-                 'interaction_distance': 1.5},
-            ],
-            'initial_particles': {'A': _random_positions(50, 5.0, seed=42)},
-            'timestep': 0.005,
-            'observe_stride': 50,
+def _random_positions_sphere(n, radius=6.0, seed=None):
+    """Generate n random positions uniformly inside a sphere of given radius."""
+    if seed is not None:
+        np.random.seed(seed)
+    positions = []
+    while len(positions) < n:
+        p = (np.random.random(3) * 2 - 1) * radius
+        if np.linalg.norm(p) < radius:
+            positions.append(p.tolist())
+    return positions
+
+
+def _downsample_snapshots(snapshots, max_snaps=50):
+    if len(snapshots) > max_snaps:
+        step = len(snapshots) // max_snaps
+        return snapshots[::step]
+    return snapshots
+
+
+# ── Simulation 1: Actin Filament Treadmilling (topology) ──────────
+
+def run_simulation_actin():
+    """Run actin filament treadmilling using ReaDDy topologies directly."""
+    import readdy
+
+    np.random.seed(42)
+    t0 = time.perf_counter()
+
+    system = readdy.ReactionDiffusionSystem(box_size=[20., 20., 20.], unit_system=None)
+    system.add_species('substrate', 0.5)
+    system.add_topology_species('head', 0.1)
+    system.add_topology_species('core', 0.1)
+    system.add_topology_species('tail', 0.1)
+    system.topologies.add_type('filament')
+
+    # All bond types (needed for robustness during type changes)
+    for t1, t2 in [('head', 'core'), ('core', 'core'), ('core', 'tail'),
+                   ('head', 'tail'), ('tail', 'tail'), ('head', 'head')]:
+        system.topologies.configure_harmonic_bond(t1, t2, force_constant=100, length=1.)
+
+    # All angle types for rigidity
+    all_types = ['head', 'core', 'tail']
+    for t1 in all_types:
+        for t2 in all_types:
+            for t3 in all_types:
+                system.topologies.configure_harmonic_angle(
+                    t1, t2, t3, force_constant=20., equilibrium_angle=np.pi)
+
+    # Polymerization at barbed (head) end
+    system.topologies.add_spatial_reaction(
+        'attach: filament(head) + (substrate) -> filament(core--head)',
+        rate=15.0, radius=1.5)
+
+    # Depolymerization at pointed (tail) end - structural reaction
+    def depoly_rate(topology):
+        vertices = topology.get_graph().get_vertices()
+        return 0.02 if len(vertices) > 3 else 0.
+
+    def depoly_reaction(topology):
+        recipe = readdy.StructuralReactionRecipe(topology)
+        vertices = topology.get_graph().get_vertices()
+        for v in vertices:
+            if topology.particle_type_of_vertex(v) == 'tail':
+                neighbors = v.neighbors()
+                if neighbors:
+                    adj_idx = neighbors[0].get().particle_index
+                    recipe.separate_vertex(v.particle_index)
+                    recipe.change_particle_type(v.particle_index, 'substrate')
+                    for vi, vv in enumerate(vertices):
+                        if vv.particle_index == adj_idx:
+                            recipe.change_particle_type(vi, 'tail')
+                            break
+                break
+        return recipe
+
+    system.topologies.add_structural_reaction(
+        'depolymerize', 'filament', depoly_reaction, depoly_rate)
+
+    system.potentials.add_harmonic_repulsion(
+        'substrate', 'substrate', force_constant=10., interaction_distance=0.8)
+
+    # Create simulation
+    sim = system.simulation(kernel='CPU')
+    sim.show_progress = False
+
+    # Initial filament: head-core-core-tail
+    positions = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], dtype=float)
+    top = sim.add_topology('filament', ['head', 'core', 'core', 'tail'], positions)
+    g = top.get_graph()
+    g.add_edge(0, 1)
+    g.add_edge(1, 2)
+    g.add_edge(2, 3)
+
+    # 300 substrate particles
+    sub_pos = (np.random.random((300, 3)) - 0.5) * 18
+    for p in sub_pos:
+        sim.add_particle('substrate', p.tolist())
+
+    # Set up observables via callbacks
+    n_steps = 30000
+    timestep = 0.005
+    observe_stride = 100
+
+    count_data = []
+    energy_data = []
+    position_data = []
+
+    species_order = ['head', 'core', 'substrate', 'tail']
+
+    sim.observe.number_of_particles(
+        stride=observe_stride, types=species_order,
+        callback=lambda x: count_data.append(np.array(x)))
+    sim.observe.energy(
+        stride=observe_stride,
+        callback=lambda x: energy_data.append(float(x)))
+    sim.observe.particle_positions(
+        stride=observe_stride,
+        callback=lambda x: position_data.append(
+            [[p[0], p[1], p[2]] for p in x]))
+
+    sim.run(n_steps, timestep=timestep)
+    runtime = time.perf_counter() - t0
+
+    # Build trajectory data
+    n_points = len(energy_data)
+    times = [i * observe_stride * timestep for i in range(n_points)]
+    counts = {}
+    for i, sp in enumerate(species_order):
+        counts[sp] = [int(c[i]) for c in count_data]
+
+    # Derive filament length series (head + core + tail)
+    filament_length = []
+    for j in range(n_points):
+        fl = counts['head'][j] + counts['core'][j] + counts['tail'][j]
+        filament_length.append(fl)
+    counts['filament_length'] = filament_length
+
+    traj_data = {
+        'times': times,
+        'counts': counts,
+        'energy': list(energy_data),
+    }
+
+    # Build position snapshots
+    pos_snapshots = []
+    for idx, positions_list in enumerate(position_data):
+        real_time = idx * observe_stride * timestep
+        pos_snapshots.append({
+            'time': round(real_time, 6),
+            'positions': positions_list,
+        })
+
+    return traj_data, pos_snapshots, runtime
+
+
+# ── Simulation 2: Lotka-Volterra Predator-Prey (wrapper) ──────────
+
+def run_simulation_lotka_volterra():
+    """Run Lotka-Volterra predator-prey using the PBG wrapper."""
+    np.random.seed(100)
+    core = allocate_core()
+    core.register_link('ReaDDyProcess', ReaDDyProcess)
+
+    config = {
+        'box_size': (15., 15., 15.),
+        'species': {'A': 1.5, 'B': 1.5},
+        'reactions': [
+            {'descriptor': 'reproduce: A -> A +(2) A', 'rate': 0.3},
+            {'method': 'enzymatic', 'name': 'eat', 'catalyst': 'B',
+             'type_from': 'A', 'type_to': 'B', 'rate': 0.8,
+             'educt_distance': 3.0},
+            {'descriptor': 'death: B ->', 'rate': 0.4},
+        ],
+        'potentials': [
+            {'type': 'harmonic_repulsion', 'species1': 'A',
+             'species2': 'A', 'force_constant': 5.,
+             'interaction_distance': 1.0},
+            {'type': 'harmonic_repulsion', 'species1': 'B',
+             'species2': 'B', 'force_constant': 5.,
+             'interaction_distance': 1.0},
+            {'type': 'harmonic_repulsion', 'species1': 'A',
+             'species2': 'B', 'force_constant': 5.,
+             'interaction_distance': 1.0},
+        ],
+        'initial_particles': {
+            'A': _random_positions(30, 6.0, seed=100),
+            'B': _random_positions(10, 6.0, seed=200),
         },
-        'n_steps': 10000,
-        'camera': [14, 10, 14],
+        'timestep': 0.005,
+        'observe_stride': 50,
+    }
+
+    t0 = time.perf_counter()
+    proc = ReaDDyProcess(config=config, core=core)
+    proc.initial_state()
+
+    n_steps = 10000
+    interval = n_steps * config['timestep']
+    proc.update({}, interval=interval)
+    runtime = time.perf_counter() - t0
+
+    traj_data = proc.get_trajectory_data()
+    pos_snapshots = proc.get_position_snapshots()
+    return traj_data, pos_snapshots, runtime
+
+
+# ── Simulation 3: Living Polymer Equilibrium (topology) ───────────
+
+def run_simulation_living_polymers():
+    """Run living polymer equilibrium using ReaDDy topologies directly."""
+    import readdy
+
+    np.random.seed(300)
+    t0 = time.perf_counter()
+
+    system = readdy.ReactionDiffusionSystem(box_size=[40., 40., 40.], unit_system=None)
+    system.topologies.add_type('Polymer')
+    system.add_topology_species('Head', 0.05)
+    system.add_topology_species('Tail', 0.05)
+
+    # Bonds for all combos
+    for t1, t2 in [('Head', 'Tail'), ('Tail', 'Tail'), ('Head', 'Head')]:
+        system.topologies.configure_harmonic_bond(t1, t2, force_constant=50, length=1.)
+
+    # Angles for all combos
+    for t1 in ['Head', 'Tail']:
+        for t2 in ['Head', 'Tail']:
+            for t3 in ['Head', 'Tail']:
+                system.topologies.configure_harmonic_angle(
+                    t1, t2, t3, force_constant=10, equilibrium_angle=np.pi)
+
+    # Association: two polymer heads merge
+    system.topologies.add_spatial_reaction(
+        'associate: Polymer(Head) + Polymer(Head) -> Polymer(Tail--Tail)',
+        rate=0.5, radius=1.0)
+
+    # Dissociation structural reaction (break random internal bond)
+    def dissociation_rate(topology):
+        vertices = topology.get_graph().get_vertices()
+        n_edges = 0
+        for v in vertices:
+            n_edges += len(v.neighbors())
+        n_edges //= 2  # each edge counted twice
+        if n_edges > 2:
+            return 0.00005 * n_edges
+        return 0.
+
+    def dissociation_reaction(topology):
+        recipe = readdy.StructuralReactionRecipe(topology)
+        graph = topology.get_graph()
+        edges = graph.get_edges()
+
+        if len(edges) <= 2:
+            return recipe
+
+        # Collect endpoint vertex indices (degree 1)
+        vertices = graph.get_vertices()
+        endpoint_indices = set()
+        for vi, v in enumerate(vertices):
+            if len(v.neighbors()) == 1:
+                endpoint_indices.add(vi)
+
+        # Collect internal edges (not touching endpoints)
+        internal_edges = []
+        for e in edges:
+            vi1 = e[0].get().particle_index
+            vi2 = e[1].get().particle_index
+            # Find vertex indices
+            idx1 = idx2 = None
+            for vi, v in enumerate(vertices):
+                if v.particle_index == vi1:
+                    idx1 = vi
+                if v.particle_index == vi2:
+                    idx2 = vi
+            if idx1 is not None and idx2 is not None:
+                if idx1 not in endpoint_indices and idx2 not in endpoint_indices:
+                    internal_edges.append((e, idx1, idx2))
+
+        if not internal_edges:
+            return recipe
+
+        # Pick a random internal edge to break
+        choice = internal_edges[np.random.randint(len(internal_edges))]
+        edge, vi1, vi2 = choice
+
+        recipe.remove_edge(edge[0], edge[1])
+        recipe.change_particle_type(vi1, 'Head')
+        recipe.change_particle_type(vi2, 'Head')
+
+        return recipe
+
+    system.topologies.add_structural_reaction(
+        'dissociate', 'Polymer', dissociation_reaction, dissociation_rate)
+
+    # Create simulation
+    sim = system.simulation(kernel='CPU')
+    sim.show_progress = False
+
+    # Initialize 200 short polymers (4 particles: Head-Tail-Tail-Head)
+    for i in range(200):
+        cx, cy, cz = (np.random.random(3) - 0.5) * 36
+        # Random orientation
+        direction = np.random.randn(3)
+        direction = direction / (np.linalg.norm(direction) + 1e-8)
+        positions_top = np.array([
+            [cx - 1.5 * direction[0], cy - 1.5 * direction[1], cz - 1.5 * direction[2]],
+            [cx - 0.5 * direction[0], cy - 0.5 * direction[1], cz - 0.5 * direction[2]],
+            [cx + 0.5 * direction[0], cy + 0.5 * direction[1], cz + 0.5 * direction[2]],
+            [cx + 1.5 * direction[0], cy + 1.5 * direction[1], cz + 1.5 * direction[2]],
+        ])
+        top = sim.add_topology('Polymer',
+                               ['Head', 'Tail', 'Tail', 'Head'],
+                               positions_top)
+        g = top.get_graph()
+        g.add_edge(0, 1)
+        g.add_edge(1, 2)
+        g.add_edge(2, 3)
+
+    # Observables
+    n_steps = 30000
+    timestep = 0.5
+    observe_stride = 100
+
+    count_data = []
+    energy_data = []
+    position_data = []
+
+    species_order = ['Head', 'Tail']
+
+    sim.observe.number_of_particles(
+        stride=observe_stride, types=species_order,
+        callback=lambda x: count_data.append(np.array(x)))
+    sim.observe.energy(
+        stride=observe_stride,
+        callback=lambda x: energy_data.append(float(x)))
+    sim.observe.particle_positions(
+        stride=observe_stride,
+        callback=lambda x: position_data.append(
+            [[p[0], p[1], p[2]] for p in x]))
+
+    sim.run(n_steps, timestep=timestep)
+    runtime = time.perf_counter() - t0
+
+    # Build trajectory data
+    n_points = len(energy_data)
+    times = [i * observe_stride * timestep for i in range(n_points)]
+    counts = {}
+    for i, sp in enumerate(species_order):
+        counts[sp] = [int(c[i]) for c in count_data]
+
+    # Derive average chain length: total_particles / num_chains
+    # num_chains = Head_count / 2 (each chain has 2 heads)
+    avg_chain_length = []
+    for j in range(n_points):
+        total = counts['Head'][j] + counts['Tail'][j]
+        n_chains = max(counts['Head'][j] / 2, 1)
+        avg_chain_length.append(round(total / n_chains, 1))
+    counts['avg_chain_length'] = avg_chain_length
+
+    traj_data = {
+        'times': times,
+        'counts': counts,
+        'energy': list(energy_data),
+    }
+
+    pos_snapshots = []
+    for idx, positions_list in enumerate(position_data):
+        real_time = idx * observe_stride * timestep
+        pos_snapshots.append({
+            'time': round(real_time, 6),
+            'positions': positions_list,
+        })
+
+    return traj_data, pos_snapshots, runtime
+
+
+# ── Simulation 4: Crowded Diffusion with Spherical Confinement ────
+
+def run_simulation_crowded_sphere():
+    """Run crowded diffusion with spherical confinement using ReaDDy directly."""
+    import readdy
+
+    np.random.seed(400)
+    t0 = time.perf_counter()
+
+    system = readdy.ReactionDiffusionSystem(box_size=[20., 20., 20.], unit_system=None)
+    system.periodic_boundary_conditions = [False, False, False]
+    system.add_species('P', 0.5)
+    system.potentials.add_harmonic_repulsion(
+        'P', 'P', force_constant=20., interaction_distance=2.0)
+    system.potentials.add_sphere(
+        'P', force_constant=50., origin=[0, 0, 0], radius=7., inclusion=True)
+
+    sim = system.simulation(kernel='CPU')
+    sim.show_progress = False
+
+    # 80 particles inside sphere of radius 6
+    sphere_pos = _random_positions_sphere(80, radius=6.0, seed=400)
+    for p in sphere_pos:
+        sim.add_particle('P', p)
+
+    n_steps = 10000
+    timestep = 0.002
+    observe_stride = 50
+
+    count_data = []
+    energy_data = []
+    position_data = []
+
+    species_order = ['P']
+
+    sim.observe.number_of_particles(
+        stride=observe_stride, types=species_order,
+        callback=lambda x: count_data.append(np.array(x)))
+    sim.observe.energy(
+        stride=observe_stride,
+        callback=lambda x: energy_data.append(float(x)))
+    sim.observe.particle_positions(
+        stride=observe_stride,
+        callback=lambda x: position_data.append(
+            [[p[0], p[1], p[2]] for p in x]))
+
+    sim.run(n_steps, timestep=timestep)
+    runtime = time.perf_counter() - t0
+
+    n_points = len(energy_data)
+    times = [i * observe_stride * timestep for i in range(n_points)]
+    counts = {}
+    for i, sp in enumerate(species_order):
+        counts[sp] = [int(c[i]) for c in count_data]
+
+    traj_data = {
+        'times': times,
+        'counts': counts,
+        'energy': list(energy_data),
+    }
+
+    pos_snapshots = []
+    for idx, positions_list in enumerate(position_data):
+        real_time = idx * observe_stride * timestep
+        pos_snapshots.append({
+            'time': round(real_time, 6),
+            'positions': positions_list,
+        })
+
+    return traj_data, pos_snapshots, runtime
+
+
+# ── Simulation Configs (metadata for report) ──────────────────────
+
+SIM_CONFIGS = [
+    {
+        'id': 'actin',
+        'title': 'Actin Filament Treadmilling',
+        'subtitle': 'Topology-based polymerization and structural depolymerization',
+        'description': (
+            'An actin-like filament grows at its barbed (head) end by recruiting '
+            'diffusing substrate monomers via a spatial topology reaction, while '
+            'simultaneously losing monomers at the pointed (tail) end through a '
+            'structural reaction. This treadmilling produces a steady-state '
+            'filament length that balances polymerization and depolymerization rates. '
+            'Topological bonds enforce linear chain geometry with angular rigidity.'
+        ),
+        'box_size': [20., 20., 20.],
+        'species_list': ['head', 'core', 'tail', 'substrate'],
+        'species_colors': {
+            'head': '#818cf8', 'core': '#6366f1',
+            'tail': '#a78bfa', 'substrate': '#c7d2fe',
+        },
+        'chart_species': ['head', 'core', 'tail', 'substrate', 'filament_length'],
+        'chart_colors': {
+            'head': '#818cf8', 'core': '#6366f1', 'tail': '#a78bfa',
+            'substrate': '#c7d2fe', 'filament_length': '#4f46e5',
+        },
+        'n_steps': 30000,
+        'timestep': 0.005,
+        'observe_stride': 100,
+        'camera': [24, 16, 24],
         'color_scheme': 'indigo',
-        'species_colors': {'A': '#6366f1', 'B': '#f43f5e'},
+        'uses_topologies': True,
+        'reactions_display': [
+            'attach: filament(head) + substrate -> filament(core--head)',
+            'depolymerize: structural (tail end release)',
+        ],
+        'runner': run_simulation_actin,
     },
     {
         'id': 'lotka_volterra',
-        'title': 'Lotka-Volterra Oscillations',
+        'title': 'Lotka-Volterra Predator-Prey',
         'subtitle': 'Predator-prey dynamics with spatial stochasticity',
         'description': (
             'A spatial Lotka-Volterra predator-prey model: prey (A) reproduce '
             'by fission, predators (B) consume prey upon contact via enzymatic '
-            'reaction (A + B → B + B), and predators spontaneously decay. '
+            'reaction (A + B -> B + B), and predators spontaneously decay. '
             'Spatial diffusion and stochastic reactions introduce noise and '
-            'fluctuations around the classical oscillatory dynamics.'
+            'fluctuations around the classical oscillatory dynamics. This uses '
+            'the ReaDDyProcess PBG wrapper for configuration-driven setup.'
         ),
+        'box_size': [15., 15., 15.],
+        'species_list': ['A', 'B'],
+        'species_colors': {'A': '#10b981', 'B': '#f59e0b'},
+        'chart_species': ['A', 'B'],
+        'chart_colors': {'A': '#10b981', 'B': '#f59e0b'},
+        'n_steps': 10000,
+        'timestep': 0.005,
+        'observe_stride': 50,
+        'camera': [18, 12, 18],
+        'color_scheme': 'emerald',
+        'uses_topologies': False,
+        'reactions_display': [
+            'reproduce: A -> A + A',
+            'eat: A + B -> B + B (enzymatic)',
+            'death: B ->',
+        ],
         'config': {
             'box_size': (15., 15., 15.),
             'species': {'A': 1.5, 'B': 1.5},
@@ -103,99 +568,120 @@ CONFIGS = [
             'timestep': 0.005,
             'observe_stride': 50,
         },
-        'n_steps': 10000,
-        'camera': [18, 12, 18],
-        'color_scheme': 'emerald',
-        'species_colors': {'A': '#10b981', 'B': '#f59e0b'},
+        'runner': run_simulation_lotka_volterra,
     },
     {
-        'id': 'crowding',
-        'title': 'Crowded Diffusion',
-        'subtitle': 'Dense particle packing with excluded-volume repulsion',
+        'id': 'living_polymers',
+        'title': 'Living Polymer Equilibrium',
+        'subtitle': 'Reversible polymerization with association and dissociation',
         'description': (
-            'One hundred particles with strong excluded-volume repulsion '
-            'diffuse in a periodic box, reaching a disordered equilibrium '
-            'packing. There are no reactions — this tests pure Brownian '
-            'dynamics with pair potentials. The energy measures the total '
-            'repulsive interaction, which decreases as particles spread '
-            'apart to avoid overlap.'
+            'Two hundred short polymer chains (Head-Tail-Tail-Head) undergo '
+            'reversible association: chain heads merge via spatial topology '
+            'reactions, while a structural reaction randomly breaks internal '
+            'bonds. Over time the system reaches a dynamic equilibrium between '
+            'chain growth and fragmentation, producing an exponential-like '
+            'chain length distribution characteristic of living polymers.'
         ),
-        'config': {
-            'box_size': (10., 10., 10.),
-            'species': {'P': 0.8},
-            'reactions': [],
-            'potentials': [
-                {'type': 'harmonic_repulsion', 'species1': 'P',
-                 'species2': 'P', 'force_constant': 20.,
-                 'interaction_distance': 2.0},
-            ],
-            'initial_particles': {'P': _random_positions(100, 4.5, seed=300)},
-            'timestep': 0.002,
-            'observe_stride': 50,
+        'box_size': [40., 40., 40.],
+        'species_list': ['Head', 'Tail'],
+        'species_colors': {'Head': '#f59e0b', 'Tail': '#6366f1'},
+        'chart_species': ['Head', 'Tail', 'avg_chain_length'],
+        'chart_colors': {
+            'Head': '#f59e0b', 'Tail': '#6366f1',
+            'avg_chain_length': '#d97706',
         },
+        'n_steps': 30000,
+        'timestep': 0.5,
+        'observe_stride': 100,
+        'camera': [50, 35, 50],
+        'color_scheme': 'amber',
+        'uses_topologies': True,
+        'reactions_display': [
+            'associate: Polymer(Head) + Polymer(Head) -> Polymer(Tail--Tail)',
+            'dissociate: structural (random bond break)',
+        ],
+        'runner': run_simulation_living_polymers,
+    },
+    {
+        'id': 'crowded_sphere',
+        'title': 'Crowded Diffusion with Spherical Confinement',
+        'subtitle': 'Dense particle packing inside a confining sphere',
+        'description': (
+            'Eighty particles with strong excluded-volume repulsion diffuse '
+            'inside a spherical confining potential (radius 7), reaching a '
+            'disordered equilibrium packing. There are no reactions -- this '
+            'tests pure Brownian dynamics with pair potentials and a confining '
+            'sphere_in potential. The energy decreases as particles spread '
+            'apart to minimize repulsive overlap within the spherical boundary.'
+        ),
+        'box_size': [20., 20., 20.],
+        'species_list': ['P'],
+        'species_colors': {'P': '#f43f5e'},
+        'chart_species': ['P'],
+        'chart_colors': {'P': '#f43f5e'},
         'n_steps': 10000,
+        'timestep': 0.002,
+        'observe_stride': 50,
         'camera': [12, 8, 12],
         'color_scheme': 'rose',
-        'species_colors': {'P': '#f43f5e'},
+        'uses_topologies': False,
+        'reactions_display': [],
+        'runner': run_simulation_crowded_sphere,
     },
 ]
 
 
-# ── Simulation Runner ───────────────────────────────────────────────
-
-def run_simulation(cfg_entry):
-    """Run a simulation, returning snapshots and trajectory data."""
-    core = allocate_core()
-    core.register_link('ReaDDyProcess', ReaDDyProcess)
-
-    t0 = time.perf_counter()
-    proc = ReaDDyProcess(config=cfg_entry['config'], core=core)
-    proc.initial_state()
-
-    dt = cfg_entry['config']['timestep']
-    n_steps = cfg_entry['n_steps']
-    interval = n_steps * dt
-    proc.update({}, interval=interval)
-
-    runtime = time.perf_counter() - t0
-
-    traj_data = proc.get_trajectory_data()
-    pos_snapshots = proc.get_position_snapshots()
-
-    return traj_data, pos_snapshots, runtime
-
-
 # ── Bigraph Image ───────────────────────────────────────────────────
 
-def generate_bigraph_image(cfg_entry):
-    """Generate a colored bigraph-viz PNG for the composite document."""
+def generate_bigraph_image(cfg):
+    """Generate a colored bigraph-viz PNG for the simulation."""
     from bigraph_viz import plot_bigraph
 
-    species_list = sorted(cfg_entry['config']['species'].keys())
-    emit_ports = {sp: f'overwrite[integer]' for sp in species_list}
-
-    doc = {
-        'readdy': {
-            '_type': 'process',
-            'address': 'local:ReaDDyProcess',
-            'outputs': {
-                'particle_counts': ['stores', 'particle_counts'],
-                'total_particles': ['stores', 'total_particles'],
-                'energy': ['stores', 'energy'],
-                'positions': ['stores', 'positions'],
+    if cfg.get('uses_topologies'):
+        # Simplified diagram for topology-based sims
+        doc = {
+            'readdy': {
+                '_type': 'process',
+                'address': 'local:ReaDDy (topologies)',
+                'outputs': {
+                    'particle_counts': ['stores', 'particle_counts'],
+                    'positions': ['stores', 'positions'],
+                    'energy': ['stores', 'energy'],
+                },
             },
-        },
-        'stores': {},
-        'emitter': {
-            '_type': 'step',
-            'address': 'local:ram-emitter',
-            'inputs': {
-                'total_particles': ['stores', 'total_particles'],
-                'energy': ['stores', 'energy'],
-                'time': ['global_time'],
+            'stores': {},
+            'emitter': {
+                '_type': 'step',
+                'address': 'local:ram-emitter',
+                'inputs': {
+                    'energy': ['stores', 'energy'],
+                    'time': ['global_time'],
+                },
             },
-        },
-    }
+        }
+    else:
+        doc = {
+            'readdy': {
+                '_type': 'process',
+                'address': 'local:ReaDDyProcess',
+                'outputs': {
+                    'particle_counts': ['stores', 'particle_counts'],
+                    'total_particles': ['stores', 'total_particles'],
+                    'energy': ['stores', 'energy'],
+                    'positions': ['stores', 'positions'],
+                },
+            },
+            'stores': {},
+            'emitter': {
+                '_type': 'step',
+                'address': 'local:ram-emitter',
+                'inputs': {
+                    'total_particles': ['stores', 'total_particles'],
+                    'energy': ['stores', 'energy'],
+                    'time': ['global_time'],
+                },
+            },
+        }
 
     node_colors = {
         ('readdy',): '#6366f1',
@@ -222,20 +708,47 @@ def generate_bigraph_image(cfg_entry):
     return f'data:image/png;base64,{b64}'
 
 
-def build_pbg_document(cfg_entry):
+def build_pbg_document(cfg):
     """Build the PBG composite document dict for display."""
-    cfg = cfg_entry['config']
-    return make_readdy_document(
-        box_size=list(cfg['box_size']),
-        species=cfg['species'],
-        reactions=cfg.get('reactions', []),
-        potentials=cfg.get('potentials', []),
-        initial_particles={k: f'[{len(v)} positions]'
-                           for k, v in cfg.get('initial_particles', {}).items()},
-        timestep=cfg['timestep'],
-        observe_stride=cfg['observe_stride'],
-        interval=cfg_entry['n_steps'] * cfg['timestep'],
-    )
+    if cfg.get('uses_topologies'):
+        # Build a representative document for topology sims
+        species_dict = {sp: 0.0 for sp in cfg['species_list']}
+        return {
+            'readdy_topologies': {
+                '_type': 'process',
+                'address': 'local:ReaDDy (direct topology API)',
+                'config': {
+                    'box_size': cfg['box_size'],
+                    'species': species_dict,
+                    'topology_types': ['filament'] if cfg['id'] == 'actin' else ['Polymer'],
+                    'n_steps': cfg['n_steps'],
+                    'timestep': cfg['timestep'],
+                    'observe_stride': cfg['observe_stride'],
+                    'note': 'Structural reactions require Python callables; not PBG-configurable',
+                },
+                'outputs': {
+                    'particle_counts': ['stores', 'particle_counts'],
+                    'positions': ['stores', 'positions'],
+                    'energy': ['stores', 'energy'],
+                },
+            },
+            'stores': {},
+        }
+    else:
+        wrapper_config = cfg.get('config', {})
+        return make_readdy_document(
+            box_size=list(wrapper_config.get('box_size', cfg['box_size'])),
+            species=wrapper_config.get('species', {}),
+            reactions=wrapper_config.get('reactions', []),
+            potentials=wrapper_config.get('potentials', []),
+            initial_particles={k: f'[{len(v)} positions]'
+                               for k, v in wrapper_config.get(
+                                   'initial_particles', {}).items()},
+            timestep=wrapper_config.get('timestep', cfg['timestep']),
+            observe_stride=wrapper_config.get('observe_stride',
+                                              cfg['observe_stride']),
+            interval=cfg['n_steps'] * cfg['timestep'],
+        )
 
 
 # ── Color Schemes ──────────────────────────────────────────────────
@@ -245,6 +758,8 @@ COLOR_SCHEMES = {
                'bg': '#eef2ff', 'accent': '#818cf8', 'text': '#312e81'},
     'emerald': {'primary': '#10b981', 'light': '#d1fae5', 'dark': '#059669',
                 'bg': '#ecfdf5', 'accent': '#34d399', 'text': '#064e3b'},
+    'amber': {'primary': '#f59e0b', 'light': '#fef3c7', 'dark': '#d97706',
+              'bg': '#fffbeb', 'accent': '#fbbf24', 'text': '#78350f'},
     'rose': {'primary': '#f43f5e', 'light': '#ffe4e6', 'dark': '#e11d48',
              'bg': '#fff1f2', 'accent': '#fb7185', 'text': '#881337'},
 }
@@ -253,21 +768,28 @@ COLOR_SCHEMES = {
 # ── HTML Report Generator ──────────────────────────────────────────
 
 def generate_html(sim_results, output_path):
-    """Generate comprehensive HTML report."""
+    """Generate comprehensive HTML report with 4 simulation sections."""
     sections_html = []
     all_js_data = {}
 
     for idx, (cfg, (traj_data, pos_snapshots, runtime)) in enumerate(sim_results):
         sid = cfg['id']
         cs = COLOR_SCHEMES[cfg['color_scheme']]
-        species_list = sorted(cfg['config']['species'].keys())
+        species_list = cfg['species_list']
 
         # Counts
-        initial_total = sum(
-            len(v) for v in cfg['config'].get('initial_particles', {}).values())
-        final_counts = {sp: traj_data['counts'].get(sp, [0])[-1]
-                        for sp in species_list}
+        final_counts = {}
+        for sp in species_list:
+            series = traj_data['counts'].get(sp, [0])
+            final_counts[sp] = series[-1] if series else 0
         final_total = sum(final_counts.values())
+
+        # Initial total (approximate from first data point)
+        initial_counts = {}
+        for sp in species_list:
+            series = traj_data['counts'].get(sp, [0])
+            initial_counts[sp] = series[0] if series else 0
+        initial_total = sum(initial_counts.values())
 
         # Energy
         energies = traj_data['energy']
@@ -278,20 +800,17 @@ def generate_html(sim_results, output_path):
         times = traj_data['times']
         total_time = times[-1] if times else 0
 
-        # JS data for charts and 3D viewer
-        # Downsample position snapshots if too many
-        max_snaps = 50
-        if len(pos_snapshots) > max_snaps:
-            step = len(pos_snapshots) // max_snaps
-            vis_snaps = pos_snapshots[::step]
-        else:
-            vis_snaps = pos_snapshots
+        # Downsample position snapshots
+        vis_snaps = _downsample_snapshots(pos_snapshots, max_snaps=50)
 
+        # JS data
         all_js_data[sid] = {
             'snapshots': vis_snaps,
             'camera': cfg['camera'],
-            'box_size': list(cfg['config']['box_size']),
+            'box_size': cfg['box_size'],
             'species_colors': cfg['species_colors'],
+            'chart_species': cfg.get('chart_species', list(cfg['species_colors'].keys())),
+            'chart_colors': cfg.get('chart_colors', cfg['species_colors']),
             'charts': {
                 'times': times,
                 'energy': energies,
@@ -311,22 +830,25 @@ def generate_html(sim_results, output_path):
             f'{sp}: {final_counts[sp]}' for sp in species_list)
 
         # Reaction descriptors for display
-        rxn_strs = []
-        for r in cfg['config'].get('reactions', []):
-            if 'descriptor' in r:
-                rxn_strs.append(r['descriptor'])
-            elif r.get('method') == 'enzymatic':
-                rxn_strs.append(
-                    f"{r['name']}: {r['type_from']} + {r['catalyst']} "
-                    f"-> {r['type_to']} + {r['catalyst']}")
+        rxn_strs = cfg.get('reactions_display', [])
         rxn_display = '; '.join(rxn_strs) if rxn_strs else 'None'
+
+        # Topology badge
+        topology_badge = ''
+        if cfg.get('uses_topologies'):
+            topology_badge = (
+                f'<span style="display:inline-block; background:{cs["light"]}; '
+                f'color:{cs["dark"]}; font-size:.65rem; font-weight:700; '
+                f'padding:.15rem .5rem; border-radius:6px; margin-left:.5rem; '
+                f'vertical-align:middle;">TOPOLOGIES</span>'
+            )
 
         section = f"""
     <div class="sim-section" id="sim-{sid}">
       <div class="sim-header" style="border-left: 4px solid {cs['primary']};">
         <div class="sim-number" style="background:{cs['light']}; color:{cs['dark']};">{idx+1}</div>
         <div>
-          <h2 class="sim-title">{cfg['title']}</h2>
+          <h2 class="sim-title">{cfg['title']}{topology_badge}</h2>
           <p class="sim-subtitle">{cfg['subtitle']}</p>
         </div>
       </div>
@@ -336,7 +858,7 @@ def generate_html(sim_results, output_path):
         <div class="metric"><span class="metric-label">Initial</span><span class="metric-value">{initial_total}</span><span class="metric-sub">particles</span></div>
         <div class="metric"><span class="metric-label">Final</span><span class="metric-value">{final_total}</span><span class="metric-sub">{counts_str}</span></div>
         <div class="metric"><span class="metric-label">Species</span><span class="metric-value">{len(species_list)}</span></div>
-        <div class="metric"><span class="metric-label">Reactions</span><span class="metric-value">{len(rxn_strs)}</span><span class="metric-sub" title="{rxn_display}">{rxn_display[:30]}{'...' if len(rxn_display) > 30 else ''}</span></div>
+        <div class="metric"><span class="metric-label">Reactions</span><span class="metric-value">{len(rxn_strs)}</span><span class="metric-sub" title="{rxn_display}">{rxn_display[:40]}{'...' if len(rxn_display) > 40 else ''}</span></div>
         <div class="metric"><span class="metric-label">Time</span><span class="metric-value">{total_time:.1f}</span><span class="metric-sub">sim. units</span></div>
         <div class="metric"><span class="metric-label">Steps</span><span class="metric-value">{cfg['n_steps']:,}</span></div>
         <div class="metric"><span class="metric-label">Runtime</span><span class="metric-value">{runtime:.1f}s</span></div>
@@ -346,7 +868,7 @@ def generate_html(sim_results, output_path):
       <div class="viewer-wrap">
         <canvas id="canvas-{sid}" class="mesh-canvas"></canvas>
         <div class="viewer-info">
-          <strong>{final_total}</strong> particles &middot; Box: {cfg['config']['box_size'][0]}&times;{cfg['config']['box_size'][1]}&times;{cfg['config']['box_size'][2]}<br>
+          <strong>{final_total}</strong> particles &middot; Box: {cfg['box_size'][0]}&times;{cfg['box_size'][1]}&times;{cfg['box_size'][2]}<br>
           Drag to rotate &middot; Scroll to zoom
         </div>
         <div class="legend-box" id="legend-{sid}"></div>
@@ -405,13 +927,14 @@ def generate_html(sim_results, output_path):
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
        background:#fff; color:#1e293b; line-height:1.6; }}
 .page-header {{
-  background:linear-gradient(135deg,#f8fafc 0%,#eef2ff 50%,#fdf2f8 100%);
+  background:linear-gradient(135deg,#f8fafc 0%,#eef2ff 30%,#fffbeb 60%,#fdf2f8 100%);
   border-bottom:1px solid #e2e8f0; padding:3rem;
 }}
 .page-header h1 {{ font-size:2.2rem; font-weight:800; color:#0f172a; margin-bottom:.3rem; }}
 .page-header p {{ color:#64748b; font-size:.95rem; max-width:700px; }}
 .nav {{ display:flex; gap:.8rem; padding:1rem 3rem; background:#f8fafc;
-        border-bottom:1px solid #e2e8f0; position:sticky; top:0; z-index:100; }}
+        border-bottom:1px solid #e2e8f0; position:sticky; top:0; z-index:100;
+        flex-wrap:wrap; }}
 .nav-link {{ padding:.4rem 1rem; border-radius:8px; border:1.5px solid;
              text-decoration:none; font-size:.85rem; font-weight:600;
              transition:all .15s; }}
@@ -483,6 +1006,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
 @media(max-width:900px) {{
   .charts-row,.pbg-row {{ grid-template-columns:1fr; }}
   .sim-section,.page-header {{ padding:1.5rem; }}
+  .nav {{ padding:1rem 1.5rem; }}
 }}
 </style>
 </head>
@@ -490,10 +1014,10 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
 
 <div class="page-header">
   <h1>ReaDDy Reaction-Diffusion Simulation Report</h1>
-  <p>Three particle-based reaction-diffusion simulations wrapped as
-  <strong>process-bigraph</strong> Processes using ReaDDy's Brownian dynamics
-  engine. Each configuration demonstrates a distinct biophysical scenario
-  with interactive 3D visualization and population dynamics.</p>
+  <p>Four particle-based reaction-diffusion simulations showcasing
+  <strong>process-bigraph</strong> integration with ReaDDy's Brownian dynamics
+  engine. Configurations range from topology-based actin treadmilling and
+  living polymer equilibria to predator-prey oscillations and confined diffusion.</p>
 </div>
 
 <div class="nav">{nav_items}</div>
@@ -510,7 +1034,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
 const DATA = {json.dumps(all_js_data)};
 const DOCS = {json.dumps(pbg_docs, indent=2)};
 
-// ─── JSON Tree Viewer ───
+// --- JSON Tree Viewer ---
 function renderJson(obj, depth) {{
   if (depth === undefined) depth = 0;
   if (obj === null) return '<span class="jt-null">null</span>';
@@ -568,7 +1092,7 @@ Object.keys(DOCS).forEach(sid => {{
   if (el) el.innerHTML = renderJson(DOCS[sid], 0);
 }});
 
-// ─── Three.js Particle Viewers ───
+// --- Three.js Particle Viewers ---
 const viewers = {{}};
 const playStates = {{}};
 
@@ -595,7 +1119,7 @@ function initViewer(sid) {{
   renderer.setClearColor(0x0f172a);
 
   const scene = new THREE.Scene();
-  const cam = new THREE.PerspectiveCamera(45, W/H, 0.1, 200);
+  const cam = new THREE.PerspectiveCamera(45, W/H, 0.1, 500);
   cam.position.set(...d.camera);
 
   const controls = new THREE.OrbitControls(cam, canvas);
@@ -618,7 +1142,7 @@ function initViewer(sid) {{
     new THREE.LineBasicMaterial({{color:0x334155, transparent:true, opacity:0.4}}));
   scene.add(boxLine);
 
-  // Species color map
+  // Species color map (only physical species, not derived quantities)
   const speciesColors = d.species_colors;
   const speciesNames = Object.keys(speciesColors);
 
@@ -627,7 +1151,7 @@ function initViewer(sid) {{
 
   // Instanced meshes per species
   const meshes = {{}};
-  const maxParticles = 200;  // max per species
+  const maxParticles = 500;
   speciesNames.forEach(sp => {{
     const color = new THREE.Color(speciesColors[sp]);
     const mat = new THREE.MeshPhongMaterial({{
@@ -656,15 +1180,6 @@ function initViewer(sid) {{
     if (!snap) return;
     const positions = snap.positions;
 
-    // Group positions by species based on order (ReaDDy preserves type order)
-    // Since we don't have type info per particle in callback data,
-    // we color all particles with the first species color, or if multiple species,
-    // we need a different approach.
-    // For single-species configs, all particles get one color.
-    // For multi-species, we use a simple heuristic: position-based coloring.
-
-    // Actually, for the demo, let's assign colors by index ranges based on
-    // initial counts and the known number of each species from chart data.
     const chartCounts = d.charts.counts;
     const chartTimes = d.charts.times;
 
@@ -677,7 +1192,7 @@ function initViewer(sid) {{
       if (diff < minDiff) {{ minDiff = diff; closestIdx = i; }}
     }}
 
-    // Get counts at this time
+    // Get counts at this time and assign positions to species
     let offset = 0;
     speciesNames.forEach(sp => {{
       const count = chartCounts[sp] ? chartCounts[sp][closestIdx] : 0;
@@ -695,7 +1210,7 @@ function initViewer(sid) {{
       offset += count;
     }});
 
-    // Handle any remaining particles (assign to last species)
+    // Handle remaining particles (assign to last species)
     if (offset < positions.length && speciesNames.length > 0) {{
       const lastSp = speciesNames[speciesNames.length - 1];
       const mesh = meshes[lastSp];
@@ -763,7 +1278,7 @@ function togglePlay(sid) {{
 // Init all viewers
 Object.keys(DATA).forEach(sid => initViewer(sid));
 
-// ─── Plotly Charts ───
+// --- Plotly Charts ---
 const pLayout = {{
   paper_bgcolor:'#f8fafc', plot_bgcolor:'#f8fafc',
   font:{{ color:'#64748b', family:'-apple-system,sans-serif', size:11 }},
@@ -774,22 +1289,30 @@ const pLayout = {{
 }};
 const pCfg = {{ responsive:true, displayModeBar:false }};
 
-const chartColors = ['#6366f1','#10b981','#f43f5e','#f59e0b','#8b5cf6','#06b6d4'];
+const chartColorsFallback = ['#6366f1','#10b981','#f43f5e','#f59e0b','#8b5cf6','#06b6d4'];
 
 Object.keys(DATA).forEach(sid => {{
   const c = DATA[sid].charts;
-  const speciesNames = Object.keys(c.counts);
+  const chartSpecies = DATA[sid].chart_species;
+  const chartColors = DATA[sid].chart_colors;
 
-  // Population chart
-  const countTraces = speciesNames.map((sp, i) => ({{
+  // Population / dynamics chart
+  const countTraces = chartSpecies.map((sp, i) => ({{
     x: c.times, y: c.counts[sp], type:'scatter', mode:'lines',
-    line:{{ color: DATA[sid].species_colors[sp] || chartColors[i % chartColors.length], width:2 }},
+    line:{{ color: chartColors[sp] || chartColorsFallback[i % chartColorsFallback.length], width:2,
+            dash: (sp === 'filament_length' || sp === 'avg_chain_length') ? 'dash' : 'solid' }},
     name: sp,
   }}));
 
+  const countTitle = chartSpecies.some(s => s === 'filament_length')
+    ? 'Particle Counts & Filament Length'
+    : chartSpecies.some(s => s === 'avg_chain_length')
+      ? 'Particle Counts & Avg Chain Length'
+      : 'Particle Counts';
+
   Plotly.newPlot('chart-counts-'+sid, countTraces, {{
     ...pLayout,
-    title:{{ text:'Particle Counts', font:{{ size:12, color:'#334155' }} }},
+    title:{{ text: countTitle, font:{{ size:12, color:'#334155' }} }},
     yaxis:{{...pLayout.yaxis, title:{{ text:'Count', font:{{ size:10 }} }} }},
     legend:{{ font:{{ size:10 }}, bgcolor:'rgba(0,0,0,0)' }},
     showlegend: true,
@@ -824,9 +1347,10 @@ def run_demo():
     output_path = os.path.join(demo_dir, 'report.html')
 
     sim_results = []
-    for cfg in CONFIGS:
+    for cfg in SIM_CONFIGS:
         print(f'Running: {cfg["title"]}...')
-        traj_data, pos_snapshots, runtime = run_simulation(cfg)
+        runner = cfg['runner']
+        traj_data, pos_snapshots, runtime = runner()
         sim_results.append((cfg, (traj_data, pos_snapshots, runtime)))
         print(f'  Runtime: {runtime:.2f}s')
         print(f'  {len(traj_data["times"])} time points, '

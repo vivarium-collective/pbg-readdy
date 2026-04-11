@@ -139,11 +139,18 @@ source .venv/bin/activate
 PYTHONPATH=. python demo/demo_report.py
 ```
 
-Generates `demo/report.html` — an interactive report with:
-- 3D particle viewers (Three.js) with play/pause animation
+Generates `demo/report.html` — an interactive report with 4 simulations:
+
+1. **Actin Filament Treadmilling** — topology-based polymerization at the barbed end and structural-reaction depolymerization at the pointed end, showcasing ReaDDy's unique topology features
+2. **Lotka-Volterra Predator-Prey** — spatial stochastic predator-prey dynamics with enzymatic predation, prey fission, and predator decay
+3. **Living Polymer Equilibrium** — reversible chain association/dissociation reaching dynamic equilibrium, using topology spatial and structural reactions
+4. **Crowded Diffusion in Spherical Confinement** — 80 particles with excluded-volume repulsion confined inside a spherical potential
+
+Each section includes:
+- 3D particle viewer (Three.js) with play/pause animation
 - Population dynamics and energy charts (Plotly)
-- Bigraph architecture diagrams (bigraph-viz)
-- Interactive composite document trees
+- Bigraph architecture diagram (bigraph-viz)
+- Interactive composite document tree
 
 ## License
 
