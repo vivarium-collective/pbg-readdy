@@ -131,7 +131,6 @@ def run_simulation_actin():
 
     count_data = []
     energy_data = []
-    position_data = []
 
     species_order = ['head', 'core', 'substrate', 'tail']
 
@@ -141,10 +140,12 @@ def run_simulation_actin():
     sim.observe.energy(
         stride=observe_stride,
         callback=lambda x: energy_data.append(float(x)))
-    sim.observe.particle_positions(
-        stride=observe_stride,
-        callback=lambda x: position_data.append(
-            [[p[0], p[1], p[2]] for p in x]))
+
+    # File-based trajectory + topology recording for bond extraction
+    tmpf = tempfile.mktemp(suffix='.h5')
+    sim.output_file = tmpf
+    sim.record_trajectory(stride=observe_stride)
+    sim.observe.topologies(stride=observe_stride)
 
     sim.run(n_steps, timestep=timestep)
     runtime = time.perf_counter() - t0
@@ -169,14 +170,37 @@ def run_simulation_actin():
         'energy': list(energy_data),
     }
 
-    # Build position snapshots
+    # Read positions and topology bonds from HDF5 file
+    import readdy as readdy_traj
+    traj = readdy_traj.Trajectory(tmpf)
+    time_top, topology_records = traj.read_observable_topologies()
+    frames = list(traj.read())
+
     pos_snapshots = []
-    for idx, positions_list in enumerate(position_data):
-        real_time = idx * observe_stride * timestep
+    for frame_idx, frame in enumerate(frames):
+        positions = []
+        id_to_idx = {}
+        for fi, p in enumerate(frame):
+            positions.append([float(p.position[0]), float(p.position[1]), float(p.position[2])])
+            id_to_idx[p.id] = fi
+
+        bonds = []
+        if frame_idx < len(topology_records):
+            for t in topology_records[frame_idx]:
+                for e in t.edges:
+                    pid1 = t.particles[e[0]]
+                    pid2 = t.particles[e[1]]
+                    if pid1 in id_to_idx and pid2 in id_to_idx:
+                        bonds.append([id_to_idx[pid1], id_to_idx[pid2]])
+
+        real_time = frame_idx * observe_stride * timestep
         pos_snapshots.append({
             'time': round(real_time, 6),
-            'positions': positions_list,
+            'positions': positions,
+            'bonds': bonds,
         })
+
+    os.unlink(tmpf)
 
     return traj_data, pos_snapshots, runtime
 
@@ -229,6 +253,8 @@ def run_simulation_lotka_volterra():
 
     traj_data = proc.get_trajectory_data()
     pos_snapshots = proc.get_position_snapshots()
+    for snap in pos_snapshots:
+        snap['bonds'] = []
     return traj_data, pos_snapshots, runtime
 
 
@@ -351,7 +377,6 @@ def run_simulation_living_polymers():
 
     count_data = []
     energy_data = []
-    position_data = []
 
     species_order = ['Head', 'Tail']
 
@@ -361,10 +386,12 @@ def run_simulation_living_polymers():
     sim.observe.energy(
         stride=observe_stride,
         callback=lambda x: energy_data.append(float(x)))
-    sim.observe.particle_positions(
-        stride=observe_stride,
-        callback=lambda x: position_data.append(
-            [[p[0], p[1], p[2]] for p in x]))
+
+    # File-based trajectory + topology recording for bond extraction
+    tmpf = tempfile.mktemp(suffix='.h5')
+    sim.output_file = tmpf
+    sim.record_trajectory(stride=observe_stride)
+    sim.observe.topologies(stride=observe_stride)
 
     sim.run(n_steps, timestep=timestep)
     runtime = time.perf_counter() - t0
@@ -391,13 +418,37 @@ def run_simulation_living_polymers():
         'energy': list(energy_data),
     }
 
+    # Read positions and topology bonds from HDF5 file
+    import readdy as readdy_traj
+    traj = readdy_traj.Trajectory(tmpf)
+    time_top, topology_records = traj.read_observable_topologies()
+    frames = list(traj.read())
+
     pos_snapshots = []
-    for idx, positions_list in enumerate(position_data):
-        real_time = idx * observe_stride * timestep
+    for frame_idx, frame in enumerate(frames):
+        positions = []
+        id_to_idx = {}
+        for fi, p in enumerate(frame):
+            positions.append([float(p.position[0]), float(p.position[1]), float(p.position[2])])
+            id_to_idx[p.id] = fi
+
+        bonds = []
+        if frame_idx < len(topology_records):
+            for t in topology_records[frame_idx]:
+                for e in t.edges:
+                    pid1 = t.particles[e[0]]
+                    pid2 = t.particles[e[1]]
+                    if pid1 in id_to_idx and pid2 in id_to_idx:
+                        bonds.append([id_to_idx[pid1], id_to_idx[pid2]])
+
+        real_time = frame_idx * observe_stride * timestep
         pos_snapshots.append({
             'time': round(real_time, 6),
-            'positions': positions_list,
+            'positions': positions,
+            'bonds': bonds,
         })
+
+    os.unlink(tmpf)
 
     return traj_data, pos_snapshots, runtime
 
@@ -469,6 +520,7 @@ def run_simulation_crowded_sphere():
         pos_snapshots.append({
             'time': round(real_time, 6),
             'positions': positions_list,
+            'bonds': [],
         })
 
     return traj_data, pos_snapshots, runtime
@@ -1163,6 +1215,17 @@ function initViewer(sid) {{
     meshes[sp] = im;
   }});
 
+  // Bond lines
+  const maxBonds = 2000;
+  const bondPositions = new Float32Array(maxBonds * 6);
+  const bondGeo = new THREE.BufferGeometry();
+  bondGeo.setAttribute('position', new THREE.BufferAttribute(bondPositions, 3));
+  const bondMat = new THREE.LineBasicMaterial({{
+    color: 0xffffff, transparent: true, opacity: 0.6, linewidth: 1
+  }});
+  const bondLines = new THREE.LineSegments(bondGeo, bondMat);
+  scene.add(bondLines);
+
   // Build legend
   const legendEl = document.getElementById('legend-' + sid);
   speciesNames.forEach(sp => {{
@@ -1227,6 +1290,24 @@ function initViewer(sid) {{
       mesh.count = newCount;
       mesh.instanceMatrix.needsUpdate = true;
     }}
+
+    // Update bonds
+    const bonds = snap.bonds || [];
+    const nBonds = Math.min(bonds.length, maxBonds);
+    for (let i = 0; i < nBonds; i++) {{
+      const [a, b] = bonds[i];
+      if (a < positions.length && b < positions.length) {{
+        bondPositions[i*6]   = positions[a][0];
+        bondPositions[i*6+1] = positions[a][1];
+        bondPositions[i*6+2] = positions[a][2];
+        bondPositions[i*6+3] = positions[b][0];
+        bondPositions[i*6+4] = positions[b][1];
+        bondPositions[i*6+5] = positions[b][2];
+      }}
+    }}
+    for (let i = nBonds * 6; i < maxBonds * 6; i++) bondPositions[i] = 0;
+    bondGeo.attributes.position.needsUpdate = true;
+    bondGeo.setDrawRange(0, nBonds * 2);
   }}
 
   updateParticles(0);
