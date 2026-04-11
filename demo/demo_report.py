@@ -258,127 +258,65 @@ def run_simulation_lotka_volterra():
     return traj_data, pos_snapshots, runtime
 
 
-# ── Simulation 3: Living Polymer Equilibrium (topology) ───────────
+# ── Simulation 3: Growing Polymer (topology) ───────────────────────
 
-def run_simulation_living_polymers():
-    """Run living polymer equilibrium using ReaDDy topologies directly."""
+def run_simulation_growing_polymer():
+    """Run a polymer growing from a seed into a concentrated substrate pool."""
     import readdy
 
     np.random.seed(300)
     t0 = time.perf_counter()
 
-    system = readdy.ReactionDiffusionSystem(box_size=[40., 40., 40.], unit_system=None)
-    system.topologies.add_type('Polymer')
-    system.add_topology_species('Head', 0.05)
-    system.add_topology_species('Tail', 0.05)
+    system = readdy.ReactionDiffusionSystem(box_size=[15., 15., 15.], unit_system=None)
+    system.add_species('substrate', 1.0)
+    system.add_topology_species('head', 0.05)
+    system.add_topology_species('core', 0.05)
+    system.add_topology_species('tail', 0.05)
+    system.topologies.add_type('filament')
 
-    # Bonds for all combos
-    for t1, t2 in [('Head', 'Tail'), ('Tail', 'Tail'), ('Head', 'Head')]:
-        system.topologies.configure_harmonic_bond(t1, t2, force_constant=50, length=1.)
-
-    # Angles for all combos
-    for t1 in ['Head', 'Tail']:
-        for t2 in ['Head', 'Tail']:
-            for t3 in ['Head', 'Tail']:
+    # All bond and angle types
+    for t1, t2 in [('head', 'core'), ('core', 'core'), ('core', 'tail'),
+                   ('head', 'tail'), ('tail', 'tail'), ('head', 'head')]:
+        system.topologies.configure_harmonic_bond(t1, t2, force_constant=100, length=1.)
+    all_t = ['head', 'core', 'tail']
+    for t1 in all_t:
+        for t2 in all_t:
+            for t3 in all_t:
                 system.topologies.configure_harmonic_angle(
-                    t1, t2, t3, force_constant=10, equilibrium_angle=np.pi)
+                    t1, t2, t3, force_constant=30., equilibrium_angle=np.pi)
 
-    # Association: two polymer heads merge
+    # Fast polymerization — substrate attaches at head end
     system.topologies.add_spatial_reaction(
-        'associate: Polymer(Head) + Polymer(Head) -> Polymer(Tail--Tail)',
-        rate=0.5, radius=1.0)
+        'attach: filament(head) + (substrate) -> filament(core--head)',
+        rate=20.0, radius=1.5)
 
-    # Dissociation structural reaction (break random internal bond)
-    def dissociation_rate(topology):
-        vertices = topology.get_graph().get_vertices()
-        n_edges = 0
-        for v in vertices:
-            n_edges += len(v.neighbors())
-        n_edges //= 2  # each edge counted twice
-        if n_edges > 2:
-            return 0.00005 * n_edges
-        return 0.
+    # Mild substrate repulsion
+    system.potentials.add_harmonic_repulsion(
+        'substrate', 'substrate', force_constant=5., interaction_distance=0.8)
 
-    def dissociation_reaction(topology):
-        recipe = readdy.StructuralReactionRecipe(topology)
-        graph = topology.get_graph()
-        edges = graph.get_edges()
-
-        if len(edges) <= 2:
-            return recipe
-
-        # Collect endpoint vertex indices (degree 1)
-        vertices = graph.get_vertices()
-        endpoint_indices = set()
-        for vi, v in enumerate(vertices):
-            if len(v.neighbors()) == 1:
-                endpoint_indices.add(vi)
-
-        # Collect internal edges (not touching endpoints)
-        internal_edges = []
-        for e in edges:
-            vi1 = e[0].get().particle_index
-            vi2 = e[1].get().particle_index
-            # Find vertex indices
-            idx1 = idx2 = None
-            for vi, v in enumerate(vertices):
-                if v.particle_index == vi1:
-                    idx1 = vi
-                if v.particle_index == vi2:
-                    idx2 = vi
-            if idx1 is not None and idx2 is not None:
-                if idx1 not in endpoint_indices and idx2 not in endpoint_indices:
-                    internal_edges.append((e, idx1, idx2))
-
-        if not internal_edges:
-            return recipe
-
-        # Pick a random internal edge to break
-        choice = internal_edges[np.random.randint(len(internal_edges))]
-        edge, vi1, vi2 = choice
-
-        recipe.remove_edge(edge[0], edge[1])
-        recipe.change_particle_type(vi1, 'Head')
-        recipe.change_particle_type(vi2, 'Head')
-
-        return recipe
-
-    system.topologies.add_structural_reaction(
-        'dissociate', 'Polymer', dissociation_reaction, dissociation_rate)
-
-    # Create simulation
     sim = system.simulation(kernel='CPU')
     sim.show_progress = False
 
-    # Initialize 200 short polymers (4 particles: Head-Tail-Tail-Head)
-    for i in range(200):
-        cx, cy, cz = (np.random.random(3) - 0.5) * 36
-        # Random orientation
-        direction = np.random.randn(3)
-        direction = direction / (np.linalg.norm(direction) + 1e-8)
-        positions_top = np.array([
-            [cx - 1.5 * direction[0], cy - 1.5 * direction[1], cz - 1.5 * direction[2]],
-            [cx - 0.5 * direction[0], cy - 0.5 * direction[1], cz - 0.5 * direction[2]],
-            [cx + 0.5 * direction[0], cy + 0.5 * direction[1], cz + 0.5 * direction[2]],
-            [cx + 1.5 * direction[0], cy + 1.5 * direction[1], cz + 1.5 * direction[2]],
-        ])
-        top = sim.add_topology('Polymer',
-                               ['Head', 'Tail', 'Tail', 'Head'],
-                               positions_top)
-        g = top.get_graph()
-        g.add_edge(0, 1)
-        g.add_edge(1, 2)
-        g.add_edge(2, 3)
+    # Seed filament: head-core-tail
+    pos = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=float)
+    top = sim.add_topology('filament', ['head', 'core', 'tail'], pos)
+    g = top.get_graph()
+    g.add_edge(0, 1)
+    g.add_edge(1, 2)
 
-    # Observables
-    n_steps = 30000
-    timestep = 0.5
-    observe_stride = 100
+    # Dense substrate cloud — 500 monomers
+    sub_pos = (np.random.random((500, 3)) - 0.5) * 13
+    for p in sub_pos:
+        sim.add_particle('substrate', p.tolist())
+
+    n_steps = 20000
+    timestep = 0.005
+    observe_stride = 200
 
     count_data = []
     energy_data = []
-
-    species_order = ['Head', 'Tail']
+    position_data = []
+    species_order = ['head', 'core', 'tail', 'substrate']
 
     sim.observe.number_of_particles(
         stride=observe_stride, types=species_order,
@@ -386,12 +324,10 @@ def run_simulation_living_polymers():
     sim.observe.energy(
         stride=observe_stride,
         callback=lambda x: energy_data.append(float(x)))
-
-    # File-based trajectory + topology recording for bond extraction
-    tmpf = tempfile.mktemp(suffix='.h5')
-    sim.output_file = tmpf
-    sim.record_trajectory(stride=observe_stride)
-    sim.observe.topologies(stride=observe_stride)
+    sim.observe.particle_positions(
+        stride=observe_stride,
+        callback=lambda x: position_data.append(
+            [[p[0], p[1], p[2]] for p in x]))
 
     sim.run(n_steps, timestep=timestep)
     runtime = time.perf_counter() - t0
@@ -403,14 +339,10 @@ def run_simulation_living_polymers():
     for i, sp in enumerate(species_order):
         counts[sp] = [int(c[i]) for c in count_data]
 
-    # Derive average chain length: total_particles / num_chains
-    # num_chains = Head_count / 2 (each chain has 2 heads)
-    avg_chain_length = []
+    chain_length = []
     for j in range(n_points):
-        total = counts['Head'][j] + counts['Tail'][j]
-        n_chains = max(counts['Head'][j] / 2, 1)
-        avg_chain_length.append(round(total / n_chains, 1))
-    counts['avg_chain_length'] = avg_chain_length
+        chain_length.append(counts['head'][j] + counts['core'][j] + counts['tail'][j])
+    counts['chain_length'] = chain_length
 
     traj_data = {
         'times': times,
@@ -418,75 +350,58 @@ def run_simulation_living_polymers():
         'energy': list(energy_data),
     }
 
-    # Read positions and topology bonds from HDF5 file
-    import readdy as readdy_traj
-    traj = readdy_traj.Trajectory(tmpf)
-    time_top, topology_records = traj.read_observable_topologies()
-    frames = list(traj.read())
-
     pos_snapshots = []
-    for frame_idx, frame in enumerate(frames):
-        positions = []
-        id_to_idx = {}
-        for fi, p in enumerate(frame):
-            positions.append([float(p.position[0]), float(p.position[1]), float(p.position[2])])
-            id_to_idx[p.id] = fi
-
-        bonds = []
-        if frame_idx < len(topology_records):
-            for t in topology_records[frame_idx]:
-                for e in t.edges:
-                    pid1 = t.particles[e[0]]
-                    pid2 = t.particles[e[1]]
-                    if pid1 in id_to_idx and pid2 in id_to_idx:
-                        bonds.append([id_to_idx[pid1], id_to_idx[pid2]])
-
-        real_time = frame_idx * observe_stride * timestep
+    for idx, positions_list in enumerate(position_data):
+        real_time = idx * observe_stride * timestep
         pos_snapshots.append({
             'time': round(real_time, 6),
-            'positions': positions,
-            'bonds': bonds,
+            'positions': positions_list,
+            'bonds': [],
         })
-
-    os.unlink(tmpf)
 
     return traj_data, pos_snapshots, runtime
 
 
-# ── Simulation 4: Crowded Diffusion with Spherical Confinement ────
+# ── Simulation 4: Two-Species Phase Separation ─────────────────────
 
-def run_simulation_crowded_sphere():
-    """Run crowded diffusion with spherical confinement using ReaDDy directly."""
+def run_simulation_phase_separation():
+    """Run two-species phase separation with differential attractions."""
     import readdy
 
     np.random.seed(400)
     t0 = time.perf_counter()
 
-    system = readdy.ReactionDiffusionSystem(box_size=[20., 20., 20.], unit_system=None)
-    system.periodic_boundary_conditions = [False, False, False]
-    system.add_species('P', 0.5)
+    system = readdy.ReactionDiffusionSystem(box_size=[15., 15., 15.], unit_system=None)
+    system.add_species('A', 0.5)
+    system.add_species('B', 0.5)
+
+    # A-A weak attraction (like-like affinity drives clustering)
+    system.potentials.add_weak_interaction_piecewise_harmonic(
+        'A', 'A', force_constant=10., desired_distance=1.5, depth=2.0, cutoff=3.0)
+    # B-B weak attraction
+    system.potentials.add_weak_interaction_piecewise_harmonic(
+        'B', 'B', force_constant=10., desired_distance=1.5, depth=2.0, cutoff=3.0)
+    # A-B repulsion (unlike species repel)
     system.potentials.add_harmonic_repulsion(
-        'P', 'P', force_constant=20., interaction_distance=2.0)
-    system.potentials.add_sphere(
-        'P', force_constant=50., origin=[0, 0, 0], radius=7., inclusion=True)
+        'A', 'B', force_constant=15., interaction_distance=2.0)
 
     sim = system.simulation(kernel='CPU')
     sim.show_progress = False
 
-    # 80 particles inside sphere of radius 6
-    sphere_pos = _random_positions_sphere(80, radius=6.0, seed=400)
-    for p in sphere_pos:
-        sim.add_particle('P', p)
+    # 60 of each species, randomly mixed
+    n_each = 60
+    for _ in range(n_each):
+        sim.add_particle('A', ((np.random.random(3) - 0.5) * 13).tolist())
+        sim.add_particle('B', ((np.random.random(3) - 0.5) * 13).tolist())
 
-    n_steps = 10000
-    timestep = 0.002
+    n_steps = 15000
+    timestep = 0.005
     observe_stride = 50
 
     count_data = []
     energy_data = []
     position_data = []
-
-    species_order = ['P']
+    species_order = ['A', 'B']
 
     sim.observe.number_of_particles(
         stride=observe_stride, types=species_order,
@@ -623,62 +538,70 @@ SIM_CONFIGS = [
         'runner': run_simulation_lotka_volterra,
     },
     {
-        'id': 'living_polymers',
-        'title': 'Living Polymer Equilibrium',
-        'subtitle': 'Reversible polymerization with association and dissociation',
+        'id': 'growing_polymer',
+        'title': 'Growing Polymer',
+        'subtitle': 'Rapid polymerization from a monomer pool into a stiff filament',
         'description': (
-            'Two hundred short polymer chains (Head-Tail-Tail-Head) undergo '
-            'reversible association: chain heads merge via spatial topology '
-            'reactions, while a structural reaction randomly breaks internal '
-            'bonds. Over time the system reaches a dynamic equilibrium between '
-            'chain growth and fragmentation, producing an exponential-like '
-            'chain length distribution characteristic of living polymers.'
+            'A single seed filament (head-core-tail) recruits diffusing substrate '
+            'monomers from a concentrated pool of 500 particles. Each monomer that '
+            'contacts the head end undergoes a spatial topology reaction, extending '
+            'the chain. Angular potentials enforce rigidity, producing a stiff '
+            'polymer that snakes through the box as it grows from 3 to hundreds '
+            'of monomers. The substrate count drops as monomers are consumed.'
         ),
-        'box_size': [40., 40., 40.],
-        'species_list': ['Head', 'Tail'],
-        'species_colors': {'Head': '#f59e0b', 'Tail': '#6366f1'},
-        'chart_species': ['Head', 'Tail', 'avg_chain_length'],
-        'chart_colors': {
-            'Head': '#f59e0b', 'Tail': '#6366f1',
-            'avg_chain_length': '#d97706',
+        'box_size': [15., 15., 15.],
+        'species_list': ['head', 'core', 'tail', 'substrate'],
+        'species_colors': {
+            'head': '#f59e0b', 'core': '#d97706',
+            'tail': '#fbbf24', 'substrate': '#fef3c7',
         },
-        'n_steps': 30000,
-        'timestep': 0.5,
-        'observe_stride': 100,
-        'camera': [50, 35, 50],
+        'chart_species': ['head', 'core', 'tail', 'substrate', 'chain_length'],
+        'chart_colors': {
+            'head': '#f59e0b', 'core': '#d97706', 'tail': '#fbbf24',
+            'substrate': '#fef3c7', 'chain_length': '#b45309',
+        },
+        'n_steps': 20000,
+        'timestep': 0.005,
+        'observe_stride': 200,
+        'camera': [18, 12, 18],
         'color_scheme': 'amber',
-        'uses_topologies': True,
+        'uses_topologies': False,
         'reactions_display': [
-            'associate: Polymer(Head) + Polymer(Head) -> Polymer(Tail--Tail)',
-            'dissociate: structural (random bond break)',
+            'attach: filament(head) + substrate -> filament(core--head)',
         ],
-        'runner': run_simulation_living_polymers,
+        'runner': run_simulation_growing_polymer,
     },
     {
-        'id': 'crowded_sphere',
-        'title': 'Crowded Diffusion with Spherical Confinement',
-        'subtitle': 'Dense particle packing inside a confining sphere',
+        'id': 'phase_separation',
+        'title': 'Two-Species Phase Separation',
+        'subtitle': 'Like-like attraction drives demixing into clusters',
         'description': (
-            'Eighty particles with strong excluded-volume repulsion diffuse '
-            'inside a spherical confining potential (radius 7), reaching a '
-            'disordered equilibrium packing. There are no reactions -- this '
-            'tests pure Brownian dynamics with pair potentials and a confining '
-            'sphere_in potential. The energy decreases as particles spread '
-            'apart to minimize repulsive overlap within the spherical boundary.'
+            'One hundred and twenty particles of two species (A and B) start '
+            'randomly mixed. Like particles attract via a piecewise-harmonic '
+            'well (depth 2.0 kBT) while unlike particles repel. Over time the '
+            'system spontaneously demixes: A particles cluster together and B '
+            'particles cluster together, forming distinct phases. The energy '
+            'drops dramatically as favorable same-species contacts form. This '
+            'models liquid-liquid phase separation (LLPS) relevant to '
+            'membraneless organelles in cells.'
         ),
-        'box_size': [20., 20., 20.],
-        'species_list': ['P'],
-        'species_colors': {'P': '#f43f5e'},
-        'chart_species': ['P'],
-        'chart_colors': {'P': '#f43f5e'},
-        'n_steps': 10000,
-        'timestep': 0.002,
+        'box_size': [15., 15., 15.],
+        'species_list': ['A', 'B'],
+        'species_colors': {'A': '#f43f5e', 'B': '#3b82f6'},
+        'chart_species': ['A', 'B'],
+        'chart_colors': {'A': '#f43f5e', 'B': '#3b82f6'},
+        'n_steps': 15000,
+        'timestep': 0.005,
         'observe_stride': 50,
-        'camera': [12, 8, 12],
+        'camera': [18, 12, 18],
         'color_scheme': 'rose',
         'uses_topologies': False,
-        'reactions_display': [],
-        'runner': run_simulation_crowded_sphere,
+        'reactions_display': [
+            'A-A: weak attraction (depth 2.0)',
+            'B-B: weak attraction (depth 2.0)',
+            'A-B: harmonic repulsion',
+        ],
+        'runner': run_simulation_phase_separation,
     },
 ]
 
