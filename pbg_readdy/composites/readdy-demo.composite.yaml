@@ -1,0 +1,73 @@
+name: readdy-demo
+description: "Tiny ReaDDy reaction-diffusion demo: a few species-A particles diffusing in a small periodic box with first-order decay. Emits total_particles, energy, and time each step."
+
+requires:
+  processes: [ReaDDyProcess, RAMEmitter]
+
+parameters:
+  interval:
+    type: float
+    default: 0.5
+    description: "Process interval in simulator time units. ReaDDy advances n_steps = round(interval/timestep)."
+  decay_rate:
+    type: float
+    default: 0.1
+    description: "First-order decay rate for species A (rate of `A -> nothing`)."
+  initial_count:
+    type: int
+    default: 15
+    description: "Number of A particles to create at the origin region at t=0."
+
+state:
+  readdy:
+    _type: process
+    address: "local:ReaDDyProcess"
+    config:
+      box_size: [6.0, 6.0, 6.0]
+      periodic: [true, true, true]
+      species:
+        A: 1.0
+      reactions:
+        - descriptor: "decay: A ->"
+          rate: "${decay_rate}"
+      initial_particles:
+        A:
+          - [0.0, 0.0, 0.0]
+          - [1.0, 0.0, 0.0]
+          - [0.0, 1.0, 0.0]
+          - [0.0, 0.0, 1.0]
+          - [1.0, 1.0, 0.0]
+          - [1.0, 0.0, 1.0]
+          - [0.0, 1.0, 1.0]
+          - [1.0, 1.0, 1.0]
+          - [-1.0, 0.0, 0.0]
+          - [0.0, -1.0, 0.0]
+          - [0.0, 0.0, -1.0]
+          - [-1.0, -1.0, 0.0]
+          - [-1.0, 0.0, -1.0]
+          - [0.0, -1.0, -1.0]
+          - [-1.0, -1.0, -1.0]
+      timestep: 0.01
+      observe_stride: 10
+    inputs: {}
+    outputs:
+      total_particles: ["stores", "total_particles"]
+      energy: ["stores", "energy"]
+      time: ["stores", "time"]
+    interval: "${interval}"
+  stores:
+    total_particles: 0
+    energy: 0.0
+    time: 0.0
+  emitter:
+    _type: step
+    address: "local:RAMEmitter"
+    config:
+      emit:
+        total_particles: "integer"
+        energy: "float"
+        time: "float"
+    inputs:
+      total_particles: ["stores", "total_particles"]
+      energy: ["stores", "energy"]
+      time: ["global_time"]

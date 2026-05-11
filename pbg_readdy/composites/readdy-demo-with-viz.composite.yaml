@@ -1,0 +1,85 @@
+name: readdy-demo-with-viz
+description: "ReaDDy reaction-diffusion demo with a wired Visualization Step. Each update produces a Plotly HTML figure of the running scalar trajectories (total_particles, energy), written to the 'viz_html' store."
+
+requires:
+  processes: [ReaDDyProcess, ReaDDyPlots, RAMEmitter]
+
+parameters:
+  interval:
+    type: float
+    default: 0.5
+    description: "Process interval in simulator time units."
+  viz_title:
+    type: string
+    default: "ReaDDy decay dynamics"
+    description: "Title displayed at the top of the Plotly figure."
+  decay_rate:
+    type: float
+    default: 0.1
+    description: "First-order decay rate for species A."
+
+state:
+  readdy:
+    _type: process
+    address: "local:ReaDDyProcess"
+    config:
+      box_size: [6.0, 6.0, 6.0]
+      periodic: [true, true, true]
+      species:
+        A: 1.0
+      reactions:
+        - descriptor: "decay: A ->"
+          rate: "${decay_rate}"
+      initial_particles:
+        A:
+          - [0.0, 0.0, 0.0]
+          - [1.0, 0.0, 0.0]
+          - [0.0, 1.0, 0.0]
+          - [0.0, 0.0, 1.0]
+          - [1.0, 1.0, 0.0]
+          - [1.0, 0.0, 1.0]
+          - [0.0, 1.0, 1.0]
+          - [1.0, 1.0, 1.0]
+          - [-1.0, 0.0, 0.0]
+          - [0.0, -1.0, 0.0]
+          - [0.0, 0.0, -1.0]
+          - [-1.0, -1.0, 0.0]
+          - [-1.0, 0.0, -1.0]
+          - [0.0, -1.0, -1.0]
+          - [-1.0, -1.0, -1.0]
+      timestep: 0.01
+      observe_stride: 10
+    inputs: {}
+    outputs:
+      total_particles: ["stores", "total_particles"]
+      energy: ["stores", "energy"]
+      time: ["stores", "time"]
+    interval: "${interval}"
+  stores:
+    total_particles: 0
+    energy: 0.0
+    time: 0.0
+    viz_html: ""
+  viz:
+    _type: step
+    address: "local:ReaDDyPlots"
+    config:
+      title: "${viz_title}"
+    inputs:
+      total_particles: ["stores", "total_particles"]
+      energy: ["stores", "energy"]
+      time: ["global_time"]
+    outputs:
+      html: ["stores", "viz_html"]
+  emitter:
+    _type: step
+    address: "local:RAMEmitter"
+    config:
+      emit:
+        total_particles: "integer"
+        energy: "float"
+        time: "float"
+    inputs:
+      total_particles: ["stores", "total_particles"]
+      energy: ["stores", "energy"]
+      time: ["global_time"]
