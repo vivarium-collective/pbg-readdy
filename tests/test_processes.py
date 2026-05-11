@@ -162,3 +162,68 @@ def test_empty_initial_particles(core):
     assert state['total_particles'] == 0
     result = proc.update({}, interval=0.1)
     assert result['total_particles'] == 0
+
+
+def test_inputs_includes_wall_z(core):
+    proc = ReaDDyProcess(config={'species': {'A': 1.0}}, core=core)
+    assert proc.inputs() == {'wall_z': 'maybe[float]'}
+
+
+def test_wall_z_confines_particles(core):
+    """A low wall_z must keep particles below it after one update.
+
+    Triggers the rebuild path on first update: snapshot existing
+    particles, drop the simulation, build a fresh one with a box
+    potential extending only up to wall_z, restore particles, run.
+    Without this, the demo coupler can publish wall_z all it wants and
+    the actin field will ignore it.
+    """
+    np.random.seed(0)
+    z_band = np.linspace(-4, 4, 20)
+    cfg = {
+        'species': {'A': 1.0},
+        'initial_particles': {'A': [[0, 0, float(z)] for z in z_band]},
+        'timestep': 0.005,
+        'observe_stride': 50,
+        'box_size': (10.0, 10.0, 10.0),
+    }
+
+    no_wall = ReaDDyProcess(config=cfg, core=core)
+    no_wall.initial_state()
+    r0 = no_wall.update({}, interval=0.5)
+
+    walled = ReaDDyProcess(config=cfg, core=core)
+    walled.initial_state()
+    r1 = walled.update({'wall_z': -1.0}, interval=0.5)
+
+    max_z_no_wall = max(p[2] for p in r0['positions'])
+    max_z_walled = max(p[2] for p in r1['positions'])
+    assert max_z_walled < max_z_no_wall - 0.5, (
+        f'wall_z=-1 did not confine particles (max_z went from '
+        f'{max_z_no_wall:.3f} to {max_z_walled:.3f})')
+
+
+def test_wall_z_none_matches_no_input(core):
+    """`update({}, ...)` and `update({'wall_z': None}, ...)` must produce
+    the same simulation behavior — protects against a missing input being
+    silently treated as wall_z=0 (which would clamp every particle into
+    the lower half of the box)."""
+    np.random.seed(1)
+    cfg = {
+        'species': {'A': 1.0},
+        'initial_particles': {'A': [[0, 0, 0]] * 5},
+        'timestep': 0.01,
+        'observe_stride': 10,
+    }
+    a = ReaDDyProcess(config=cfg, core=core)
+    a.initial_state()
+    ra = a.update({}, interval=0.2)
+
+    b = ReaDDyProcess(config=cfg, core=core)
+    b.initial_state()
+    np.random.seed(1)  # match RNG sequence for the second
+    rb = b.update({'wall_z': None}, interval=0.2)
+
+    assert ra['total_particles'] == rb['total_particles']
+    # Should not have triggered a rebuild — _current_wall_z still None.
+    assert b._current_wall_z is None

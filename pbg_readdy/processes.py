@@ -10,6 +10,18 @@ import numpy as np
 from process_bigraph import Process
 
 
+def _wall_z_equal(a, b):
+    """Treat None as a distinct value (no wall) and compare floats with a
+    tight tolerance. Used to gate ReaDDy rebuilds — a stale comparison
+    would either trigger a rebuild on every step (slow) or skip rebuilds
+    when the membrane has actually moved (silent decoupling)."""
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return abs(float(a) - float(b)) < 1e-12
+
+
 class ReaDDyProcess(Process):
     """Bridge Process wrapping ReaDDy particle-based reaction-diffusion.
 
@@ -65,9 +77,24 @@ class ReaDDyProcess(Process):
         self._count_data = []
         self._energy_data = []
         self._position_data = []
+        # Track the wall-z barrier currently baked into the box potentials.
+        # None = no wall (default — existing demos behave identically). A
+        # numeric value triggers add_box potentials confining every species
+        # to z <= wall_z. When the input port reports a new value, the
+        # simulation is rebuilt with the box potential repositioned.
+        self._current_wall_z = None
+        # Cached per-species position snapshot used to restore particles
+        # across a rebuild. Populated each update() from the most recent
+        # callback-recorded positions.
+        self._particle_snapshot = None
 
     def inputs(self):
-        return {}
+        # `wall_z` is the height of the membrane-imposed upper barrier. A
+        # sibling process (e.g. a membrane simulator publishing the lowest
+        # membrane vertex) writes here. None / missing = no wall, identical
+        # to baseline ReaDDy behavior. maybe[float] (rather than bare float)
+        # so the absence of a wall is distinguishable from "wall at z=0".
+        return {'wall_z': 'maybe[float]'}
 
     def outputs(self):
         return {
@@ -78,9 +105,19 @@ class ReaDDyProcess(Process):
             'time': 'overwrite[float]',
         }
 
-    def _build_system(self):
-        """Lazily initialize the ReaDDy system and simulation."""
-        if self._system is not None:
+    def _build_system(self, override_initial_particles=None, wall_z=None):
+        """Initialize (or rebuild) the ReaDDy system and simulation.
+
+        First call: builds System with cfg['initial_particles'].
+
+        Subsequent calls (rebuild path triggered by wall_z input changes):
+        the caller supplies the current per-species particle snapshot in
+        override_initial_particles, and a new box-potential at wall_z is
+        added on every species before run() is called. Discards the prior
+        simulation, system, and accumulated observable buffers (so the
+        rebuilt simulation has a clean slate matching the new wall).
+        """
+        if self._system is not None and override_initial_particles is None:
             return
 
         import readdy
@@ -118,6 +155,20 @@ class ReaDDyProcess(Process):
         for pot in cfg['potentials']:
             self._add_potential(pot)
 
+        # Membrane-imposed wall barrier. When wall_z is set, every species
+        # gets a box potential whose extent stops at wall_z, so particles
+        # are restrained to z <= wall_z. This is the runtime input port
+        # that lets a sibling membrane simulator confine the actin field.
+        if wall_z is not None:
+            origin = [-box[0] / 2.0, -box[1] / 2.0, -box[2] / 2.0]
+            extent_z = max(1e-6, wall_z - origin[2])
+            extent = [box[0], box[1], extent_z]
+            for species_name in self._species_list:
+                self._system.potentials.add_box(
+                    species_name, force_constant=50.0,
+                    origin=origin, extent=extent)
+        self._current_wall_z = wall_z
+
         # Create simulation (no output file — use callbacks for multi-run support)
         self._simulation = self._system.simulation(kernel='CPU')
         self._simulation.reaction_handler = cfg['reaction_handler']
@@ -136,8 +187,13 @@ class ReaDDyProcess(Process):
             callback=lambda x: self._position_data.append(
                 [[p[0], p[1], p[2]] for p in x]))
 
-        # Add initial particles
-        for species_name, positions in cfg['initial_particles'].items():
+        # Add initial particles. On rebuild, the caller passes the
+        # most-recent per-species snapshot via override_initial_particles
+        # so the new simulation continues from where the old left off.
+        initial = (override_initial_particles
+                   if override_initial_particles is not None
+                   else cfg['initial_particles'])
+        for species_name, positions in initial.items():
             for pos in positions:
                 self._simulation.add_particle(species_name, pos)
 
@@ -195,6 +251,23 @@ class ReaDDyProcess(Process):
     def update(self, state, interval):
         self._build_system()
 
+        # Runtime wall_z rebuild path. When a sibling process publishes a
+        # new wall_z, snapshot every live particle by species, drop the
+        # current simulation, and rebuild with the box potential at the
+        # new height. Costly (full ReaDDy system rebuild + particle
+        # restoration), so the change-detection guard around it matters.
+        new_wall_z = state.get('wall_z')
+        if not _wall_z_equal(new_wall_z, self._current_wall_z):
+            snapshot = self._snapshot_particles_by_species()
+            self._system = None
+            self._simulation = None
+            self._species_list = None
+            self._count_data = []
+            self._energy_data = []
+            self._position_data = []
+            self._build_system(override_initial_particles=snapshot,
+                               wall_z=new_wall_z)
+
         dt = self.config['timestep']
         n_steps = max(1, int(round(interval / dt)))
 
@@ -220,6 +293,23 @@ class ReaDDyProcess(Process):
             'energy': e,
             'time': round(t, 6),
         }
+
+    def _snapshot_particles_by_species(self):
+        """Return per-species [[x,y,z], ...] positions for every live particle.
+
+        Used by the rebuild path to seed the new simulation with the same
+        particles as the old one. Reads from `simulation.current_particles`,
+        which yields particle objects whose `type` attribute names the
+        species.
+        """
+        snapshot = {sp: [] for sp in (self._species_list or [])}
+        if self._simulation is None:
+            return snapshot
+        for particle in self._simulation.current_particles:
+            sp = particle.type
+            pos = particle.pos
+            snapshot.setdefault(sp, []).append([float(pos[0]), float(pos[1]), float(pos[2])])
+        return snapshot
 
     def get_trajectory_data(self):
         """Return full time-series data from callback-accumulated observables.
