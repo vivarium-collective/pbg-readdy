@@ -62,6 +62,30 @@ class ReaDDyProcess(Process):
         'reactions': [],
         'potentials': [],
         'initial_particles': {},
+        # ---- Topology config (opt-in; bonded chains / filaments) ----
+        # Topology species are particles that participate in bonded
+        # complexes — distinct from free species above. Same {name:
+        # diffusion_constant} shape.
+        'topology_species': {},
+        # Topology type names. Each instance below references one of these.
+        'topology_types': [],
+        # Harmonic bond definitions between topology species, applied to
+        # every bonded edge between matching particle types.
+        # [{type1, type2, force_constant, length}, ...]
+        'topology_bonds': [],
+        # Optional harmonic angle potentials for chain bending stiffness.
+        # [{type1, type2, type3, force_constant, equilibrium_angle}, ...]
+        'topology_angles': [],
+        # Initial topology instances. Each entry creates one topology in
+        # the simulation:
+        # {
+        #   'type': 'filament',
+        #   'particle_types': ['F', 'F', ...],   # one per particle
+        #   'positions': [[x, y, z], ...],       # matching length
+        #   'edges': [[i, j], ...],              # bonds within the topology;
+        #                                        # default = sequential chain
+        # }
+        'initial_topologies': [],
     }
 
     def __init__(self, config=None, core=None):
@@ -105,19 +129,20 @@ class ReaDDyProcess(Process):
             'time': 'overwrite[float]',
         }
 
-    def _build_system(self, override_initial_particles=None, wall_z=None):
+    def _build_system(self, override_initial_particles=None,
+                      override_initial_topologies=None, wall_z=None):
         """Initialize (or rebuild) the ReaDDy system and simulation.
 
-        First call: builds System with cfg['initial_particles'].
+        First call: builds System with cfg['initial_particles'] and
+        cfg['initial_topologies'].
 
         Subsequent calls (rebuild path triggered by wall_z input changes):
-        the caller supplies the current per-species particle snapshot in
-        override_initial_particles, and a new box-potential at wall_z is
-        added on every species before run() is called. Discards the prior
-        simulation, system, and accumulated observable buffers (so the
-        rebuilt simulation has a clean slate matching the new wall).
+        the caller supplies the current per-species particle snapshot AND
+        the current topology snapshot, and a new box-potential at wall_z
+        is added on every species before run() is called. Discards the
+        prior simulation, system, and accumulated observable buffers.
         """
-        if self._system is not None and override_initial_particles is None:
+        if self._system is not None and override_initial_particles is None and override_initial_topologies is None:
             return
 
         import readdy
@@ -140,6 +165,28 @@ class ReaDDyProcess(Process):
         for name, diff_const in cfg['species'].items():
             self._system.add_species(name, diffusion_constant=diff_const)
 
+        # Add topology species — distinct from regular species; only these
+        # can participate in bonded topologies (chains/filaments).
+        self._topology_species_list = sorted(cfg['topology_species'].keys())
+        for name, diff_const in cfg['topology_species'].items():
+            self._system.add_topology_species(name, diffusion_constant=diff_const)
+
+        # Register topology types and their bond/angle templates.
+        for type_name in cfg['topology_types']:
+            self._system.topologies.add_type(type_name)
+        for bond in cfg['topology_bonds']:
+            self._system.topologies.configure_harmonic_bond(
+                bond['type1'], bond['type2'],
+                force_constant=bond['force_constant'],
+                length=bond['length'],
+            )
+        for angle in cfg['topology_angles']:
+            self._system.topologies.configure_harmonic_angle(
+                angle['type1'], angle['type2'], angle['type3'],
+                force_constant=angle['force_constant'],
+                equilibrium_angle=angle['equilibrium_angle'],
+            )
+
         # Add reactions
         for rxn in cfg['reactions']:
             if rxn.get('method') == 'enzymatic':
@@ -156,14 +203,15 @@ class ReaDDyProcess(Process):
             self._add_potential(pot)
 
         # Membrane-imposed wall barrier. When wall_z is set, every species
-        # gets a box potential whose extent stops at wall_z, so particles
-        # are restrained to z <= wall_z. This is the runtime input port
-        # that lets a sibling membrane simulator confine the actin field.
+        # (regular AND topology) gets a box potential whose extent stops at
+        # wall_z, so particles are restrained to z <= wall_z. This is the
+        # runtime input port that lets a sibling membrane simulator confine
+        # the actin field — including bonded filament particles.
         if wall_z is not None:
             origin = [-box[0] / 2.0, -box[1] / 2.0, -box[2] / 2.0]
             extent_z = max(1e-6, wall_z - origin[2])
             extent = [box[0], box[1], extent_z]
-            for species_name in self._species_list:
+            for species_name in self._species_list + self._topology_species_list:
                 self._system.potentials.add_box(
                     species_name, force_constant=50.0,
                     origin=origin, extent=extent)
@@ -196,6 +244,27 @@ class ReaDDyProcess(Process):
         for species_name, positions in initial.items():
             for pos in positions:
                 self._simulation.add_particle(species_name, pos)
+
+        # Add initial topologies (bonded filaments / chains). On rebuild,
+        # the caller passes a snapshot with current positions and edges so
+        # the chains' bond structure survives the rebuild intact.
+        initial_tops = (override_initial_topologies
+                        if override_initial_topologies is not None
+                        else cfg['initial_topologies'])
+        for topo_def in initial_tops:
+            positions_arr = np.asarray(topo_def['positions'], dtype=np.float64)
+            top = self._simulation.add_topology(
+                topo_def['type'],
+                list(topo_def['particle_types']),
+                positions_arr,
+            )
+            graph = top.get_graph()
+            edges = topo_def.get('edges')
+            if edges is None:
+                # Default: sequential chain — bond consecutive particles.
+                edges = [[i, i + 1] for i in range(len(positions_arr) - 1)]
+            for i, j in edges:
+                graph.add_edge(int(i), int(j))
 
     def _add_potential(self, pot):
         """Add a potential to the system from a config dict."""
@@ -252,20 +321,23 @@ class ReaDDyProcess(Process):
         self._build_system()
 
         # Runtime wall_z rebuild path. When a sibling process publishes a
-        # new wall_z, snapshot every live particle by species, drop the
-        # current simulation, and rebuild with the box potential at the
-        # new height. Costly (full ReaDDy system rebuild + particle
-        # restoration), so the change-detection guard around it matters.
+        # new wall_z, snapshot every live particle AND every live topology,
+        # drop the current simulation, and rebuild with the box potential
+        # at the new height. Costly (full ReaDDy system rebuild + particle
+        # + topology restoration), so the change-detection guard around it
+        # matters.
         new_wall_z = state.get('wall_z')
         if not _wall_z_equal(new_wall_z, self._current_wall_z):
-            snapshot = self._snapshot_particles_by_species()
+            particle_snapshot = self._snapshot_particles_by_species()
+            topology_snapshot = self._snapshot_topologies()
             self._system = None
             self._simulation = None
             self._species_list = None
             self._count_data = []
             self._energy_data = []
             self._position_data = []
-            self._build_system(override_initial_particles=snapshot,
+            self._build_system(override_initial_particles=particle_snapshot,
+                               override_initial_topologies=topology_snapshot,
                                wall_z=new_wall_z)
 
         dt = self.config['timestep']
@@ -295,21 +367,63 @@ class ReaDDyProcess(Process):
         }
 
     def _snapshot_particles_by_species(self):
-        """Return per-species [[x,y,z], ...] positions for every live particle.
+        """Return per-species [[x,y,z], ...] positions for every live FREE
+        particle (not part of a topology).
 
         Used by the rebuild path to seed the new simulation with the same
-        particles as the old one. Reads from `simulation.current_particles`,
-        which yields particle objects whose `type` attribute names the
-        species.
+        particles as the old one. Reads from `simulation.current_particles`
+        and excludes any particle that's part of a topology — those are
+        handled by `_snapshot_topologies`.
         """
         snapshot = {sp: [] for sp in (self._species_list or [])}
         if self._simulation is None:
             return snapshot
+        # Build a set of topology-particle IDs to exclude.
+        topology_particle_ids = set()
+        for top in self._simulation.current_topologies:
+            for p in top.particles:
+                topology_particle_ids.add(p.id)
         for particle in self._simulation.current_particles:
+            if particle.id in topology_particle_ids:
+                continue
             sp = particle.type
             pos = particle.pos
             snapshot.setdefault(sp, []).append([float(pos[0]), float(pos[1]), float(pos[2])])
         return snapshot
+
+    def _snapshot_topologies(self):
+        """Return a list of topology snapshots suitable for rebuild.
+
+        Each entry: {type, particle_types, positions, edges}. Edges are
+        local-within-topology indices (0..N-1) matching the order of
+        `particle_types` and `positions`, so the new simulation can rebond
+        them via add_edge() without depending on ReaDDy's internal IDs.
+
+        ReaDDy's `edge.particle_index` is a *global* particle ID, so
+        per-topology we build an id→local-index map and translate.
+        """
+        if self._simulation is None:
+            return []
+        snapshots = []
+        for top in self._simulation.current_topologies:
+            particles = list(top.particles)
+            id_to_local = {p.id: i for i, p in enumerate(particles)}
+            particle_types = [p.type for p in particles]
+            positions = [[float(p.pos[0]), float(p.pos[1]), float(p.pos[2])] for p in particles]
+            graph = top.get_graph()
+            edges = []
+            for e in graph.get_edges():
+                a_global = e[0].get().particle_index
+                b_global = e[1].get().particle_index
+                if a_global in id_to_local and b_global in id_to_local:
+                    edges.append([id_to_local[a_global], id_to_local[b_global]])
+            snapshots.append({
+                'type': top.type,
+                'particle_types': particle_types,
+                'positions': positions,
+                'edges': edges,
+            })
+        return snapshots
 
     def get_trajectory_data(self):
         """Return full time-series data from callback-accumulated observables.
