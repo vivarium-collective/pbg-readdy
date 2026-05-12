@@ -1,5 +1,6 @@
 name: readdy-demo
 description: "Tiny ReaDDy reaction-diffusion demo: a few species-A particles diffusing in a small periodic box with first-order decay. Emits total_particles, energy, and time each step."
+tags: [particles, reaction-diffusion, demo]
 
 requires:
   processes: [ReaDDyProcess, RAMEmitter]

@@ -1,5 +1,6 @@
 name: readdy-demo-with-viz
 description: "ReaDDy reaction-diffusion demo with a wired Visualization Step. Each update produces a Plotly HTML figure of the running scalar trajectories (total_particles, energy), written to the 'viz_html' store."
+tags: [particles, reaction-diffusion, demo, visualization]
 
 requires:
   processes: [ReaDDyProcess, ReaDDyPlots, RAMEmitter]
