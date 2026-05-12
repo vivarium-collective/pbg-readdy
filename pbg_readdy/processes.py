@@ -10,26 +10,34 @@ import numpy as np
 from process_bigraph import Process
 
 
+_WALL_HYSTERESIS = 1e-2
+
+
 def _wall_z_equal(a, b):
-    """Treat None as a distinct value (no wall) and compare floats with a
-    tight tolerance. Used to gate ReaDDy rebuilds — a stale comparison
-    would either trigger a rebuild on every step (slow) or skip rebuilds
-    when the membrane has actually moved (silent decoupling)."""
+    """Treat None as a distinct value (no wall). Float comparisons use a
+    1e-2 hysteresis tolerance: a coupled bigraph composite typically
+    publishes a slightly-different wall_z every step (upstream signal is
+    noisy from membrane vertex jitter), and a tighter threshold would
+    rebuild the entire ReaDDy system on every PBG step. With each rebuild
+    costing O(100ms) for a small system + topologies, that turns a
+    12-second sim into multi-minute wall time. 1e-2 (~1% of a typical
+    barrier position) preserves real coupling dynamics while filtering out
+    micro-jitter."""
     if a is None and b is None:
         return True
     if a is None or b is None:
         return False
-    return abs(float(a) - float(b)) < 1e-12
+    return abs(float(a) - float(b)) < _WALL_HYSTERESIS
 
 
 def _wall_radius_equal(a, b):
-    """Same semantics as `_wall_z_equal` but for the spherical-barrier
-    input port (`wall_radius`)."""
+    """Same hysteresis semantics as `_wall_z_equal`, for the spherical-
+    barrier input port (`wall_radius`)."""
     if a is None and b is None:
         return True
     if a is None or b is None:
         return False
-    return abs(float(a) - float(b)) < 1e-12
+    return abs(float(a) - float(b)) < _WALL_HYSTERESIS
 
 
 class ReaDDyProcess(Process):
@@ -242,8 +250,12 @@ class ReaDDyProcess(Process):
         if wall_radius is not None:
             r = max(1e-6, float(wall_radius))
             for species_name in all_species:
+                # Stiff wall — bonded filaments + their angle potentials
+                # generate substantial inward drift that a soft barrier
+                # can't contain. 500 is high enough to keep particles
+                # confined to within ~10% of the radius even under load.
                 self._system.potentials.add_sphere(
-                    species_name, force_constant=50.0,
+                    species_name, force_constant=500.0,
                     origin=[0.0, 0.0, 0.0], radius=r, inclusion=True)
         self._current_wall_z = wall_z
         self._current_wall_radius = wall_radius
