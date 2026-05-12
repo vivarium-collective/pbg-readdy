@@ -171,7 +171,44 @@ def test_empty_initial_particles(core):
 
 def test_inputs_includes_wall_z(core):
     proc = ReaDDyProcess(config={'species': {'A': 1.0}}, core=core)
-    assert proc.inputs() == {'wall_z': 'maybe[float]'}
+    assert proc.inputs() == {
+        'wall_z': 'maybe[float]',
+        'wall_radius': 'maybe[float]',
+    }
+
+
+def test_wall_radius_confines_particles(core):
+    """A small wall_radius must confine particles inside the sphere.
+    Triggers the rebuild path: snapshot existing particles, drop the
+    simulation, build a fresh one with an add_sphere(inclusion=True)
+    potential at the new radius, restore particles, run."""
+    np.random.seed(0)
+    initial = [[float(x), float(y), float(z)]
+               for x in (-2, 0, 2) for y in (-2, 0, 2) for z in (-2, 0, 2)]
+    cfg = {
+        'species': {'A': 0.5},
+        'initial_particles': {'A': initial},
+        'timestep': 0.005,
+        'observe_stride': 50,
+        'box_size': (10.0, 10.0, 10.0),
+        'periodic': (False, False, False),
+    }
+
+    no_wall = ReaDDyProcess(config=cfg, core=core)
+    no_wall.initial_state()
+    no_wall.update({}, interval=0.5)
+
+    walled = ReaDDyProcess(config=cfg, core=core)
+    walled.initial_state()
+    r = walled.update({'wall_radius': 1.5}, interval=0.5)
+
+    import math
+    max_r_walled = max(math.sqrt(p[0]**2 + p[1]**2 + p[2]**2) for p in r['positions'])
+    # Confined particles should not be much beyond the barrier (small overshoot
+    # is allowed because the barrier is a soft harmonic potential).
+    assert max_r_walled < 2.5, (
+        f'wall_radius=1.5 did not confine particles (max radial distance '
+        f'after run: {max_r_walled:.3f})')
 
 
 def test_wall_z_confines_particles(core):

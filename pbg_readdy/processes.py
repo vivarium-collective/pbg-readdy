@@ -22,6 +22,16 @@ def _wall_z_equal(a, b):
     return abs(float(a) - float(b)) < 1e-12
 
 
+def _wall_radius_equal(a, b):
+    """Same semantics as `_wall_z_equal` but for the spherical-barrier
+    input port (`wall_radius`)."""
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return abs(float(a) - float(b)) < 1e-12
+
+
 class ReaDDyProcess(Process):
     """Bridge Process wrapping ReaDDy particle-based reaction-diffusion.
 
@@ -107,18 +117,27 @@ class ReaDDyProcess(Process):
         # to z <= wall_z. When the input port reports a new value, the
         # simulation is rebuilt with the box potential repositioned.
         self._current_wall_z = None
+        # Spherical barrier — when set, every species gets an add_sphere
+        # inclusion potential of this radius centered at the origin. Used
+        # by composites where actin is confined inside a vesicle and
+        # pushes radially outward against the membrane.
+        self._current_wall_radius = None
         # Cached per-species position snapshot used to restore particles
         # across a rebuild. Populated each update() from the most recent
         # callback-recorded positions.
         self._particle_snapshot = None
 
     def inputs(self):
-        # `wall_z` is the height of the membrane-imposed upper barrier. A
-        # sibling process (e.g. a membrane simulator publishing the lowest
-        # membrane vertex) writes here. None / missing = no wall, identical
-        # to baseline ReaDDy behavior. maybe[float] (rather than bare float)
-        # so the absence of a wall is distinguishable from "wall at z=0".
-        return {'wall_z': 'maybe[float]'}
+        # `wall_z`: planar upper barrier — confines particles to z <= wall_z
+        # via add_box. Used for actin pushing UP against a membrane patch.
+        # `wall_radius`: spherical barrier — confines particles to a sphere
+        # of that radius centered at the origin via add_sphere(inclusion).
+        # Used for actin INSIDE a vesicle pushing radially outward.
+        # Both are maybe[float] so None unambiguously means "no barrier".
+        return {
+            'wall_z': 'maybe[float]',
+            'wall_radius': 'maybe[float]',
+        }
 
     def outputs(self):
         return {
@@ -130,19 +149,22 @@ class ReaDDyProcess(Process):
         }
 
     def _build_system(self, override_initial_particles=None,
-                      override_initial_topologies=None, wall_z=None):
+                      override_initial_topologies=None,
+                      wall_z=None, wall_radius=None):
         """Initialize (or rebuild) the ReaDDy system and simulation.
 
         First call: builds System with cfg['initial_particles'] and
         cfg['initial_topologies'].
 
-        Subsequent calls (rebuild path triggered by wall_z input changes):
-        the caller supplies the current per-species particle snapshot AND
-        the current topology snapshot, and a new box-potential at wall_z
-        is added on every species before run() is called. Discards the
-        prior simulation, system, and accumulated observable buffers.
+        Subsequent calls (rebuild path triggered by wall_z OR wall_radius
+        input changes): the caller supplies the current per-species
+        particle snapshot AND the current topology snapshot, and the
+        appropriate barrier potentials are added on every species before
+        run() is called. Discards the prior simulation, system, and
+        accumulated observable buffers.
         """
-        if self._system is not None and override_initial_particles is None and override_initial_topologies is None:
+        if (self._system is not None and override_initial_particles is None
+                and override_initial_topologies is None):
             return
 
         import readdy
@@ -202,20 +224,29 @@ class ReaDDyProcess(Process):
         for pot in cfg['potentials']:
             self._add_potential(pot)
 
-        # Membrane-imposed wall barrier. When wall_z is set, every species
-        # (regular AND topology) gets a box potential whose extent stops at
-        # wall_z, so particles are restrained to z <= wall_z. This is the
-        # runtime input port that lets a sibling membrane simulator confine
-        # the actin field — including bonded filament particles.
+        # Membrane-imposed wall barriers. Two flavors:
+        #   wall_z: planar — confine to z <= wall_z (add_box).
+        #   wall_radius: spherical — confine inside a sphere of that radius
+        #                centered at origin (add_sphere with inclusion=True).
+        # Both apply to every species (regular AND topology). A sibling
+        # membrane simulator can drive either via the corresponding input.
+        all_species = self._species_list + self._topology_species_list
         if wall_z is not None:
             origin = [-box[0] / 2.0, -box[1] / 2.0, -box[2] / 2.0]
             extent_z = max(1e-6, wall_z - origin[2])
             extent = [box[0], box[1], extent_z]
-            for species_name in self._species_list + self._topology_species_list:
+            for species_name in all_species:
                 self._system.potentials.add_box(
                     species_name, force_constant=50.0,
                     origin=origin, extent=extent)
+        if wall_radius is not None:
+            r = max(1e-6, float(wall_radius))
+            for species_name in all_species:
+                self._system.potentials.add_sphere(
+                    species_name, force_constant=50.0,
+                    origin=[0.0, 0.0, 0.0], radius=r, inclusion=True)
         self._current_wall_z = wall_z
+        self._current_wall_radius = wall_radius
 
         # Create simulation (no output file — use callbacks for multi-run support)
         self._simulation = self._system.simulation(kernel='CPU')
@@ -320,14 +351,15 @@ class ReaDDyProcess(Process):
     def update(self, state, interval):
         self._build_system()
 
-        # Runtime wall_z rebuild path. When a sibling process publishes a
-        # new wall_z, snapshot every live particle AND every live topology,
-        # drop the current simulation, and rebuild with the box potential
-        # at the new height. Costly (full ReaDDy system rebuild + particle
-        # + topology restoration), so the change-detection guard around it
-        # matters.
+        # Runtime barrier-rebuild path. When a sibling process publishes a
+        # new wall_z OR a new wall_radius, snapshot every live particle AND
+        # every live topology, drop the current simulation, and rebuild with
+        # the appropriate barrier potential. Costly (full ReaDDy rebuild +
+        # state restoration), so the change-detection guards matter.
         new_wall_z = state.get('wall_z')
-        if not _wall_z_equal(new_wall_z, self._current_wall_z):
+        new_wall_radius = state.get('wall_radius')
+        if (not _wall_z_equal(new_wall_z, self._current_wall_z)
+                or not _wall_radius_equal(new_wall_radius, self._current_wall_radius)):
             particle_snapshot = self._snapshot_particles_by_species()
             topology_snapshot = self._snapshot_topologies()
             self._system = None
@@ -336,9 +368,11 @@ class ReaDDyProcess(Process):
             self._count_data = []
             self._energy_data = []
             self._position_data = []
-            self._build_system(override_initial_particles=particle_snapshot,
-                               override_initial_topologies=topology_snapshot,
-                               wall_z=new_wall_z)
+            self._build_system(
+                override_initial_particles=particle_snapshot,
+                override_initial_topologies=topology_snapshot,
+                wall_z=new_wall_z, wall_radius=new_wall_radius,
+            )
 
         dt = self.config['timestep']
         n_steps = max(1, int(round(interval / dt)))
