@@ -397,26 +397,35 @@ class ReaDDyProcess(Process):
         Each entry: {type, particle_types, positions, edges}. Edges are
         local-within-topology indices (0..N-1) matching the order of
         `particle_types` and `positions`, so the new simulation can rebond
-        them via add_edge() without depending on ReaDDy's internal IDs.
+        them via add_edge().
 
-        ReaDDy's `edge.particle_index` is a *global* particle ID, so
-        per-topology we build an id→local-index map and translate.
+        ReaDDy quirk: `vertex.particle_index` is an opaque per-simulation
+        index that does not equal `particle.id` (the global ID counter
+        across simulation rebuilds) and does not equal the local
+        topology-relative index. The graph's vertex list is in 1-to-1
+        positional correspondence with `top.particles`, so we build a
+        `vertex.particle_index → local_index` map from that enumeration.
         """
         if self._simulation is None:
             return []
         snapshots = []
         for top in self._simulation.current_topologies:
             particles = list(top.particles)
-            id_to_local = {p.id: i for i, p in enumerate(particles)}
             particle_types = [p.type for p in particles]
             positions = [[float(p.pos[0]), float(p.pos[1]), float(p.pos[2])] for p in particles]
             graph = top.get_graph()
+            # Build the opaque-particle-index → local-index map by
+            # enumerating the graph's vertex list (same order as particles).
+            pi_to_local = {
+                v.particle_index: i for i, v in enumerate(graph.get_vertices())
+            }
             edges = []
             for e in graph.get_edges():
-                a_global = e[0].get().particle_index
-                b_global = e[1].get().particle_index
-                if a_global in id_to_local and b_global in id_to_local:
-                    edges.append([id_to_local[a_global], id_to_local[b_global]])
+                a = e[0].get().particle_index
+                b = e[1].get().particle_index
+                if a in pi_to_local and b in pi_to_local:
+                    edges.append([pi_to_local[a], pi_to_local[b]])
+                # Else: malformed edge — silently drop.
             snapshots.append({
                 'type': top.type,
                 'particle_types': particle_types,
